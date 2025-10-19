@@ -157,7 +157,7 @@ dependencies {
     
     implementation group: 'io.github.sasanlabs', name: 'facade-schema', version: '1.0.1'
 
-    implementation group: 'commons-fileupload', name: 'commons-fileupload', version: '1.5'
+    implementation group: 'commons-fileupload', name: 'commons-fileupload', version: '1.6.0'
 }
 
 test {
