@@ -153,7 +153,7 @@ dependencies {
     implementation group: 'com.nimbusds', name: 'nimbus-jose-jwt', version: '8.3'
 
     // https://mvnrepository.com/artifact/commons-io/commons-io
-    implementation group: 'commons-io', name: 'commons-io', version: '2.7'
+    implementation group: 'commons-io', name: 'commons-io', version: '2.14.0'
     
     implementation group: 'io.github.sasanlabs', name: 'facade-schema', version: '1.0.1'
 
