@@ -38,6 +38,10 @@ repositories {
     mavenLocal()
 }
 
+// Cross-repo dependency: vulnerable-shared-lib
+// Toggle between local path and published artifact with -PuseLocal=true
+def useLocalLib = project.hasProperty('useLocal') && project.property('useLocal') == 'true'
+
 sonarqube {
   properties {
     property "sonar.projectKey", "SasanLabs_VulnerableApp"
@@ -125,6 +129,13 @@ tasks.register('GenerateSampleVulnerability'){
 }
 
 dependencies {
+    // Cross-repo dependency: vulnerable-shared-lib (Pattern C: local or published)
+    if (useLocalLib) {
+        implementation files('../VulnerableApp-dependent/vulnerable-shared-lib/build/libs/vulnerable-shared-lib-1.0.0.jar')
+    } else {
+        implementation group: 'org.sasanlabs', name: 'vulnerable-shared-lib', version: '1.0.0'
+    }
+
     implementation group: 'org.springframework.boot', name: 'spring-boot-starter-web'
 
     // https://mvnrepository.com/artifact/org.mockito/mockito-core
