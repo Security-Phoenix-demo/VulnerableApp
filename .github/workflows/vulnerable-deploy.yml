@@ -1,0 +1,55 @@
+# INTENTIONALLY VULNERABLE — Test fixture for CI/CD exploitation assessment
+# All credentials are FAKE/SYNTHETIC test values
+name: Vulnerable Deploy Pipeline
+
+on:
+  pull_request_target:
+    branches: [master]
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  # SCENARIO 9: AWS credentials hardcoded in CI/CD (→ CRITICAL, CI_CD_CONTEXT)
+  AWS_ACCESS_KEY_ID: AKIAZTESTCICDKEY0001
+  AWS_SECRET_ACCESS_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYCICDTESTKEY
+  # SCENARIO 10: Jira token in CI/CD (→ HIGH, CI_CD_CONTEXT)
+  JIRA_TOKEN: ATATT3xFfGF0Xt7nKCICDFAKETOKEN123456789abcdef
+  JIRA_BASE_URL: https://securityphoenix.atlassian.net
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # V2: Secret exfiltration — uses ${{ secrets.* }} context
+      - name: Configure AWS
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      # V4: Artifact poisoning — publishes Docker image
+      - name: Build and Push Docker
+        run: |
+          docker build -t myregistry/app:${{ github.sha }} .
+          docker push myregistry/app:${{ github.sha }}
+
+      # V5: Lateral movement — cross-repo checkout with PAT
+      - name: Deploy to production repo
+        uses: actions/checkout@v4
+        with:
+          repository: Security-Phoenix-demo/production-configs
+          token: ${{ secrets.PAT }}
+          path: prod-configs
+
+      # Jira integration using hardcoded token
+      - name: Create Jira deployment ticket
+        run: |
+          curl -X POST "${JIRA_BASE_URL}/rest/api/3/issue" \
+            -H "Authorization: Basic $(echo -n 'ci-bot@securityphoenix.com:${JIRA_TOKEN}' | base64)" \
+            -H "Content-Type: application/json" \
+            -d '{"fields":{"project":{"key":"ASPMAIN"},"summary":"Deploy ${{ github.sha }}","issuetype":{"name":"Task"}}}'
