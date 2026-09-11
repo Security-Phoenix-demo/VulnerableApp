@@ -42,3 +42,7 @@ jobs:
           head-branch: ${{ github.head_ref }}
           cli-path: phoenix/cli/build/install/phoenix-cli/bin/phoenix
           fail-on-block: 'true'
+
+      - name: Show SARIF
+        if: always()
+        run: cat /home/runner/work/_temp/phoenix-pr-scan.sarif
