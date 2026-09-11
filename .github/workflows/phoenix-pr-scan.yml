@@ -1,0 +1,43 @@
+name: Phoenix PR Scan
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout Phoenix analyzer
+        uses: actions/checkout@v4
+        with:
+          repository: securityphoenix/agent-code-analyzer-r2
+          token: ${{ secrets.PHX_CLONE_TOKEN }}
+          path: phoenix
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Build Phoenix CLI
+        working-directory: phoenix/cli
+        run: ./gradlew installDist
+
+      - name: Run Phoenix PR Scan
+        uses: ./phoenix/github-action
+        with:
+          api-url: ${{ secrets.PHOENIX_API_URL }}
+          api-token: ${{ secrets.PHOENIX_API_TOKEN }}
+          base-branch: ${{ github.base_ref }}
+          head-branch: ${{ github.head_ref }}
+          cli-path: phoenix/cli/build/install/phoenix-cli/bin/phoenix
+          fail-on-block: 'true'
