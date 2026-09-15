@@ -63,3 +63,8 @@ guardrail-enforcement/demo/demo.env
 
 # Local MCP server config — contains a live Phoenix bearer token.
 .mcp.json
+
+# Backups of the files above. A .bak of a secrets file is still a secrets file,
+# and it is exactly the artefact a careful edit leaves behind.
+*.bak
+*.orig
