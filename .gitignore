@@ -45,9 +45,21 @@ build/
 
 .purplephx/credentials.json
 
-# Phoenix guardrail demo settings — holds a real API token. Never commit it.
-# The committed template is guardrail-enforcement/demo/demo.env.example
+# --- Secrets: never commit -------------------------------------------------
+# Applies anywhere in the tree, not just the one path that prompted it. A
+# settings file that holds a credential is the single most common accidental
+# commit, and the cost of the rule being slightly too wide is zero: the
+# *.example templates below are what gets committed instead.
+*.env
+.env
+.env.*
+
+# Templates ARE committed. They carry placeholders, never real values.
+!*.env.example
+!.env.example
+
+# Named explicitly too, so grepping .gitignore for it finds a hit.
 guardrail-enforcement/demo/demo.env
 
-# Local MCP server config — contains a live Phoenix bearer token. Never commit.
+# Local MCP server config — contains a live Phoenix bearer token.
 .mcp.json
