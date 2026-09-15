@@ -1,0 +1,28 @@
+## Purple Session Enforcement
+
+Phoenix Security ships three layers of security control for this repository, in this pack and on
+the Phoenix Security platform. They are not interchangeable, and only one of them cannot be
+bypassed locally:
+
+| Layer | Artefact | Runs against | Can be bypassed by |
+|---|---|---|---|
+| **A. Advisory** | This `CLAUDE.md` block, `.claude/rules/purple-scan-enforcement.md`, and the `purple-scan` skill | Nothing — it is guidance text only | The model simply not following it |
+| **B. Automatic** | The `PreToolUse` hook wired from `.claude-hooks-gate.json` (`scripts/purplephx-gate.sh`), which runs before `git commit`, `git push`, and `gh pr create` | The model, automatically, with no agreement required — but it is still local code | The developer deleting the hook or the script |
+| **C. Enforced** | Server-side PR policy on the Phoenix Security platform | The human submitting the change | Nothing available from this machine |
+
+**The word "enforced" describes layer C only.** Layer A is advisory text competing with every
+other token in the model's context — the model can, and sometimes will, ignore it. Layer B runs
+automatically and can genuinely block a commit or push from completing, but it is still a script
+installed in this project: a developer who removes the hook, the script, or `.claude/settings.json`
+removes the control along with it, which is why this pack calls it Automatic and reserves the
+other word for layer C. Only layer C survives the developer, because it does not run on the
+developer's own machine at all — it evaluates the pull request on the server, after it has been
+pushed.
+
+If a control needs to hold even when the person working in this repository would rather it
+didn't, it must be configured as a server-side PR policy (layer C). Nothing in this pack — not
+this file, not the hook, not the rule — can provide that guarantee by itself.
+
+See `.claude/rules/purple-scan-enforcement.md` for what the installed hook actually does and how
+to work with it, and the Enforcement tab in the Phoenix Security dashboard for the currently
+configured mode, severities, and domains.

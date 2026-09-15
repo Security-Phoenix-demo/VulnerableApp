@@ -1,0 +1,83 @@
+# INTENTIONALLY VULNERABLE — Phoenix correlation test fixture. NOT deployable manifest.
+# All credentials are FAKE/SYNTHETIC (base64 of obviously-fake plaintext).
+#
+# TARGET: PHX-IAC-COMB-001 "Public ingress + privileged pod + no NetworkPolicy"
+#   = rulePattern PHX-IAC-SINK-K8S-LB + propertyMatch `privileged=true`
+#     + absentResourceType NetworkPolicy
+#
+# EXPECTED PARTIAL: the `privileged=true` component is EXPECTED TO FAIL TO MATCH, so COMB-001 is
+# NOT expected to fire from this file alone. IacToxicCombinationEngine's key=value form reads
+# `asset.properties["privileged"]` — a TOP-LEVEL property key. In a real Kubernetes manifest
+# `privileged` lives at spec.template.spec.containers[].securityContext.privileged, several levels
+# down, and asText() on the intermediate object nodes returns "". There is no way to express a
+# genuine, parseable K8s Deployment that puts `privileged` at the top level, so this is a
+# limitation of the RULE, not of the fixture.
+#
+# What this file IS still expected to produce: a PHX-IAC-SINK-K8S-LB sink (Service type
+# LoadBalancer, reached from the Secret's literal-credential taint origin), plus independent
+# privileged-container / hostPath findings from Trivy/Checkov/KICS. Those are real, chainable
+# findings; only the COMB-001 rule match is blocked.
+#
+# DO NOT ADD a NetworkPolicy anywhere in this repository — it satisfies COMB-001's absence
+# component, and if the privileged component is ever fixed, its absence is what keeps the rule live.
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: phx-testbed-app-secret
+  namespace: default
+type: Opaque
+stringData:
+  # FAKE — literal plaintext, no entropy. Taint origin: path matches /password/ and /token/.
+  database_password: "phx-testbed-fake-password-0123456789"
+  api_token: "abcdef1234567890ABCDEF1234567890"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: phx-testbed-public-lb
+  namespace: default
+spec:
+  # LoadBalancer + no providerChain is exactly what buildSinkCatalog matches for
+  # PHX-IAC-SINK-K8S-LB.
+  type: LoadBalancer
+  selector:
+    app: phx-testbed-privileged
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: phx-testbed-privileged
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: phx-testbed-privileged
+  template:
+    metadata:
+      labels:
+        app: phx-testbed-privileged
+    spec:
+      # Load-bearing: referencing the Secret is what links this Deployment to the taint origin.
+      containers:
+        - name: app
+          image: openjdk:11-jre-slim
+          securityContext:
+            # Nested — see the EXPECTED PARTIAL note in the header.
+            privileged: true
+            allowPrivilegeEscalation: true
+            runAsUser: 0
+          envFrom:
+            - secretRef:
+                name: phx-testbed-app-secret
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /

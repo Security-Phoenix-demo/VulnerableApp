@@ -30,3 +30,24 @@ build/
 
 /_site
 /docs/_site
+
+.purplephx/session.env
+
+.purplephx/session-runs/
+
+.purplephx/session-runs/*.json
+
+.purplephx/ci-artifacts/
+
+.purplephx-ci/
+
+.phoenix/
+
+.purplephx/credentials.json
+
+# Phoenix guardrail demo settings — holds a real API token. Never commit it.
+# The committed template is guardrail-enforcement/demo/demo.env.example
+guardrail-enforcement/demo/demo.env
+
+# Local MCP server config — contains a live Phoenix bearer token. Never commit.
+.mcp.json
