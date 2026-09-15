@@ -323,6 +323,17 @@ warn "THIS IS A MOCK. The findings are canned. It proves the hook, not the scann
 # would make the demo prove nothing. This is not a credential: the mock server is
 # local and ignores it. It only has to satisfy the gate's charset check.
 export PHX_API_TOKEN="$MOCK_TOKEN"
+
+# Mock mode OWNS these two, and overrides whatever demo.env or the operator's
+# shell put there. The gate resolves PHX_API_BASE from the environment FIRST and
+# only falls back to its baked value when the environment is empty — so a
+# PHX_API_BASE left over from demo.env silently retargets the gate at the real
+# backend while this demo reports the mock server as up. That is the exact shape
+# of failure the pack exists to prevent, reproduced by its own demo.
+export PHX_API_BASE="http://127.0.0.1:$PORT"
+# Org and workspace ids belong to the real backend, not the mock. Carrying them
+# over makes the mock's answers look scoped when they are not.
+unset PHX_ORG_ID PHX_WORKSPACE_ID
 pause
 fi
 
@@ -436,8 +447,14 @@ pause
 # ============================================================================
 step "What you just saw, and what you did not"
 printf '\n'
-say "SAW:  a CRITICAL finding introduced by a staged change stopped a commit"
-say "      inside the agent session, with exit code 2, before any code landed."
+if [ "$RC_VULN" = "2" ]; then
+  say "SAW:  a CRITICAL finding introduced by a staged change stopped a commit"
+  say "      inside the agent session, with exit code 2, before any code landed."
+else
+  bad "NOT SEEN: the commit was NOT blocked (exit $RC_VULN). Whatever the steps"
+  bad "      above narrated, this run did not demonstrate a block. Check the"
+  bad "      gate.log line: a \"skip\" means the gate never verified anything."
+fi
 say "SAW:  the same guardrail rules installed for Claude Code, Cursor, Gemini"
 say "      and Codex from one command."
 printf '\n'
