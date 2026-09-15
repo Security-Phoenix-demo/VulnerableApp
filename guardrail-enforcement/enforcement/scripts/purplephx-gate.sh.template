@@ -1395,6 +1395,86 @@ if [ -z "$PHX_TMP_ROOT" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 10b. API-key exchange (added 2026-09-15)
+#
+# THE BUG THIS FIXES. Every endpoint this gate calls lives under
+# `/api/v1/external/**`, and ExternalTokenAuthenticationFilter rejects any bearer
+# that does not start with `phx_at_` BEFORE it looks anything up:
+#
+#     val looksLikeAccessToken = rawBearer.startsWith(ExternalAccessTokenService.TOKEN_PREFIX)
+#     ...
+#     if (!looksLikeAccessToken) { return unauthorized(exchange, path) }
+#
+# `TOKEN_PREFIX = "phx_at_"`. The Phoenix UI hands an operator a `phx_live_*` API
+# KEY, and the installation guide said only "set PHX_API_TOKEN" — so the shipped
+# gate sent the API key raw, got a bodiless 401 with NO server-side log line, and
+# reported BACKEND UNREACHABLE on every first install. The gate was honest that a
+# skip is not a pass, but an operator reading "BACKEND UNREACHABLE" blames their
+# network, not their token type. That is this file's own named failure shape —
+# a control that installs, reports itself active, and verifies nothing — reached
+# by the one route the file did not guard: the credential's own SHAPE.
+#
+# Fix: exchange the API key for a short-lived `phx_at_*` access token at
+# POST /api/v1/external/auth/token. Deliberate properties of the code below:
+#
+#   * Runs ONCE per invocation, here, after PHX_TMP_ROOT exists and before the
+#     first authenticated call. Every later call (policy, resolve, execute, poll,
+#     sarif, and the violation flush in the EXIT trap) then authenticates with the
+#     exchanged token through the UNCHANGED phx_curl_config — no call site moves.
+#   * The exchanged token's TTL is an hour, far longer than this gate's whole
+#     budget, so there is deliberately no refresh path to get wrong.
+#   * A failed exchange is a SKIP, never a pass, and it distinguishes the two
+#     causes. A token of the wrong SHAPE is a configuration mistake the operator
+#     can fix in one command; reporting it as an outage sends them to the wrong
+#     place, which is precisely the defect this block exists to remove.
+#   * The key still never reaches argv: the exchange reuses phx_curl_config's
+#     stdin config file, exactly like every other network call in this file.
+#
+# A `phx_at_*` token in PHX_API_TOKEN keeps today's behaviour EXACTLY: no extra
+# call, no extra budget spent, nothing new that can fail.
+# ---------------------------------------------------------------------------
+case "$PHX_API_TOKEN" in
+  phx_at_*)
+    # Already an access token. Nothing to do.
+    :
+    ;;
+  phx_live_*|phx_dev_*)
+    phx_budget_ok 3 || phx_finish_skip "budget_expired" "budget_expired_before_token_exchange" \
+      "[purplephx] BUDGET EXPIRED - gate skipped before the API key could be exchanged for an access token. No scan ran, so NOTHING about this diff has been verified."
+    phx_xchg_body="$PHX_TMP_ROOT/token-exchange.json"
+    phx_xchg_http="$(phx_curl_config | curl -sS --config - \
+        --max-time "$(phx_call_deadline)" \
+        -X POST \
+        -H 'Content-Type: application/json' \
+        --data-binary '{}' \
+        -o "$phx_xchg_body" -w '%{http_code}' \
+        "$PHX_API_BASE/api/v1/external/auth/token" 2>/dev/null)" || phx_xchg_http=""
+    if [ "$phx_xchg_http" != "200" ]; then
+      phx_finish_skip "backend_unreachable" "token_exchange_failed" \
+        "[purplephx] BACKEND UNREACHABLE - gate skipped: exchanging the PHX_API_TOKEN API key for an access token at ${PHX_API_BASE}/api/v1/external/auth/token returned '${phx_xchg_http:-no response}'. No scan ran, so NOTHING about this diff has been verified. A 401 here means the API key is wrong, revoked, expired, or belongs to a different Phoenix environment than PHX_API_BASE points at."
+    fi
+    phx_xchg_token="$(jq -r '.accessToken // ""' "$phx_xchg_body" 2>/dev/null)"
+    rm -f "$phx_xchg_body" 2>/dev/null
+    case "$phx_xchg_token" in
+      phx_at_*) ;;
+      *)
+        phx_finish_skip "backend_unreachable" "token_exchange_unparseable" \
+          "[purplephx] BACKEND UNREACHABLE - gate skipped: the token-exchange response carried no usable phx_at_* accessToken. No scan ran, so NOTHING about this diff has been verified."
+        ;;
+    esac
+    # Every call after this line authenticates with the exchanged access token.
+    PHX_API_TOKEN="$phx_xchg_token"
+    ;;
+  *)
+    # Deliberately NOT worded as an outage. Nothing was sent, nothing is down, and
+    # the operator has a one-command fix. Reporting this as BACKEND UNREACHABLE is
+    # what cost the original defect its diagnosability.
+    phx_finish_skip "backend_unreachable" "api_token_wrong_shape" \
+      "[purplephx] WRONG TOKEN TYPE - gate skipped: PHX_API_TOKEN is not a recognised Phoenix credential. It must be either a 'phx_at_' access token, or a 'phx_live_'/'phx_dev_' API key (from Phoenix Settings -> API keys), which this gate exchanges for one automatically. Nothing was sent, and NOTHING about this diff has been verified."
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
 # 11. Policy resolution (design section 8, AC-P3-7, AC-P3-8, F8)
 #
 # 200                         -> use it, cache it, print "(server, fetched Ns ago)"
