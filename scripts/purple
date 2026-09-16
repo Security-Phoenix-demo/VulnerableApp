@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PHX_ROOT="/Users/francescocipollone/Documents/GitHub/agent-code-analyzer-r2-bench"
+exec bash "$PHX_ROOT/scripts/purple" "$@"

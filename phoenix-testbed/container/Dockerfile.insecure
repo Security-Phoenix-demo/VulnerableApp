@@ -1,0 +1,47 @@
+# INTENTIONALLY VULNERABLE — Phoenix correlation test fixture. NOT a build target.
+# All credentials are FAKE/SYNTHETIC (AWS documentation example / alphabet sequence).
+#
+# NAMED `Dockerfile.insecure`, NOT `Dockerfile`, so no build context picks it up by default.
+#
+# TARGET: CONTAINER-class findings, plus the container leg of correlation edge C.
+#
+# HONEST LIMIT on the edge-C container leg: it is expected NOT to prove, and not because of this
+# file. AssetChainEdgeVerifier compares the peer's `assetAddress` against resource addresses that
+# IacGraphQueryService.buildFileToAssets resolves from the SECRET's own file — and none of the five
+# IaC asset parsers ever emits an image reference as a resourceAddress (recorded as a known gap in
+# the correlation feature doc). So a CONTAINER row's image ref has nothing to match. The
+# SECRET <-> IaC leg of edge C is the half that can actually fire; see
+# iac/terraform/01-s3-public-unlogged.tf.
+
+# Old base image with known CVEs, pinned deliberately.
+FROM openjdk:8u151-jdk-alpine
+
+# Running as root — no USER directive anywhere in this file.
+
+# Baked-in credentials: these become container-scan findings AND secret-scan findings on the same
+# lines, which is exactly the cross-class pair that CANNOT be deduplicated today (phx_key is null
+# on every row in this deployment, so DedupEdgeVerifier's phxKey path is dead and dedup never
+# crosses classes). Useful as a standing demonstration of that gap.
+# FAKE — AWS's own published documentation example key pair.
+ENV AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+ENV AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+# FAKE — alphabet sequence.
+ENV DB_PASSWORD=aBcDeFgHiJkLmNoPqRsTuVwXyZ012345
+
+# Copies the whole build context, so anything committed alongside — including the Terraform
+# fixtures and their hardcoded credentials — ships into the image layer.
+COPY . /app
+
+WORKDIR /app
+
+# curl | sh from an unpinned remote source: supply-chain sink.
+RUN apk add --no-cache curl bash \
+    && curl -sSL http://example.invalid/install.sh | sh
+
+# World-writable application directory.
+RUN chmod -R 777 /app
+
+EXPOSE 8080
+
+# Shell form, so the process runs under a shell and inherits every env var above.
+CMD java -jar /app/build/libs/VulnerableApp.jar

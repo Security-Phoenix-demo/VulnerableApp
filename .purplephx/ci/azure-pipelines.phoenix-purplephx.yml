@@ -1,0 +1,59 @@
+trigger: none
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  PHX_CI_STATE_DIR: .purplephx-ci
+  PHX_ARTIFACT_DIR: .purplephx/ci-artifacts
+  PHX_REPO_NAME: $(Build.Repository.Name)
+
+steps:
+  - checkout: self
+    fetchDepth: 0
+
+  - script: sudo apt-get update -y && sudo apt-get install -y jq
+    displayName: Install jq
+
+  - script: bash scripts/purple ci analyze "$(PHX_REPO_NAME)"
+    displayName: Refresh graph context
+    env:
+      PHX_API_BASE: $(PHX_API_BASE)
+      PHX_API_KEY: $(PHX_API_KEY)
+
+  - script: bash scripts/purple ci scan STANDARD_ASSESSMENT "$(PHX_REPO_NAME)"
+    displayName: Run standard assessment
+    env:
+      PHX_API_BASE: $(PHX_API_BASE)
+      PHX_API_KEY: $(PHX_API_KEY)
+
+  - script: bash scripts/purple ci fetch-results "$(PHX_REPO_NAME)" SESSION_END
+    displayName: Retrieve latest assessment result
+    condition: always()
+    env:
+      PHX_API_BASE: $(PHX_API_BASE)
+      PHX_API_KEY: $(PHX_API_KEY)
+
+  - script: |
+      mkdir -p "$(PHX_ARTIFACT_DIR)"
+      bash scripts/purple ci export-results markdown "$(PHX_ARTIFACT_DIR)"
+      cp "$(PHX_CI_STATE_DIR)/latest.json" "$(PHX_ARTIFACT_DIR)/raw-response.json"
+    displayName: Export CI artifacts
+    condition: always()
+
+  - script: bash scripts/purple ci fail-on-policy "$(PHX_ARTIFACT_DIR)/summary.json" 0 5
+    displayName: Enforce policy gate
+    condition: always()
+
+  - publish: $(PHX_ARTIFACT_DIR)
+    artifact: purplephx-ci
+    condition: always()
+
+  - publish: $(PHX_CI_STATE_DIR)
+    artifact: purplephx-state
+    condition: always()

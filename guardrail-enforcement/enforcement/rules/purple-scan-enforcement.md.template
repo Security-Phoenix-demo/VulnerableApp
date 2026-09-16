@@ -1,0 +1,54 @@
+# Purple Scan Policy — Session Hook Gate
+
+## When This Rule Applies
+
+Always active in this repository once the Phoenix Security enforcement pack is installed. It
+governs how you (the coding agent) must treat the `PreToolUse` hook wired from
+`.claude-hooks-gate.json` (`scripts/purplephx-gate.sh`), which runs automatically before
+`git commit`, `git push`, and `gh pr create`.
+
+## What this is
+
+The installed hook checks the change you are about to commit or push against this
+organization's configured Phoenix Security enforcement policy. Depending on the mode an org admin
+has configured, it can:
+
+- **advisory** — report new findings to you without blocking the tool call.
+- **gate** — require a recent, matching passing scan receipt before the tool call proceeds.
+- **block** — refuse the tool call outright when a finding at or above the configured severity is
+  newly introduced by this change.
+
+A denied commit or push means the gate found something; it is not a malfunction to route around.
+
+## What this is not
+
+**Claude Code only. No other editor has a blocking hook.** This mechanism is a Claude Code
+`PreToolUse` hook, specific to this harness. It has no equivalent in any other editor or agent
+this repository might be opened in, even where this same file is also read there as
+`.cursorrules` or `.windsurfrules` guidance text — do not assume the same protection exists in an
+environment other than Claude Code just because this text is present there too.
+
+**This runs on the developer's machine and can be removed by them. For a gate they cannot remove,
+use PR policies.**
+
+## Working within it
+
+- Do not disable, bypass, rewrite, or route around this hook, `.claude/settings.json`'s
+  `PreToolUse` wiring, or `scripts/purplephx-gate.sh` in order to make a commit or push succeed.
+  Do not suggest the user do so either.
+- If a commit or push is denied, treat that as evidence of a real finding: fix the finding (or ask
+  the user how they want to proceed) rather than weakening, deleting, or working around the gate.
+- If the gate is skipping — because the backend is unreachable, a required binary (`jq`, `curl`,
+  `git`) is missing, or a scan timed out — that is recorded in
+  `~/.phoenix/enforcement-policy/gate.log`. A skip is not a pass: do not report or imply that a
+  change "passed" Phoenix Security scanning on the strength of a skip.
+- Only an org admin can change the enforcement mode, blocking severities, or scanned domains
+  (from the Phoenix Security dashboard's Enforcement tab). This file, the hook, and the pack
+  cannot change that policy — they only carry out whatever policy is currently configured.
+
+## Related
+
+- `PHX_PURPLE_ENFORCEMENT.md` (merged into `CLAUDE.md`) — the three-layer enforcement ladder this
+  hook belongs to (Advisory / Automatic / Enforced).
+- `scripts/purplephx-gate.sh` — the gate script itself.
+- `.claude-hooks-gate.json` — the hook wiring.

@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Grep|Glob|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /Users/francescocipollone/Documents/GitHub/agent-code-analyzer-r2-bench/.claude/hooks/phx-hook.js",
+            "timeout": 10,
+            "statusMessage": "Enriching with Phoenix Security graph context..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /Users/francescocipollone/Documents/GitHub/agent-code-analyzer-r2-bench/.claude/hooks/doc-heal.sh",
+            "timeout": 15,
+            "statusMessage": "Checking documentation freshness..."
+          }
+        ]
+      }
+    ]
+  }
+}

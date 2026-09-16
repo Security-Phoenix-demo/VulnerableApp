@@ -30,3 +30,41 @@ build/
 
 /_site
 /docs/_site
+
+.purplephx/session.env
+
+.purplephx/session-runs/
+
+.purplephx/session-runs/*.json
+
+.purplephx/ci-artifacts/
+
+.purplephx-ci/
+
+.phoenix/
+
+.purplephx/credentials.json
+
+# --- Secrets: never commit -------------------------------------------------
+# Applies anywhere in the tree, not just the one path that prompted it. A
+# settings file that holds a credential is the single most common accidental
+# commit, and the cost of the rule being slightly too wide is zero: the
+# *.example templates below are what gets committed instead.
+*.env
+.env
+.env.*
+
+# Templates ARE committed. They carry placeholders, never real values.
+!*.env.example
+!.env.example
+
+# Named explicitly too, so grepping .gitignore for it finds a hit.
+guardrail-enforcement/demo/demo.env
+
+# Local MCP server config — contains a live Phoenix bearer token.
+.mcp.json
+
+# Backups of the files above. A .bak of a secrets file is still a secrets file,
+# and it is exactly the artefact a careful edit leaves behind.
+*.bak
+*.orig

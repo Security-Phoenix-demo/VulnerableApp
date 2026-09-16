@@ -1,0 +1,52 @@
+pipeline {
+  agent any
+
+  environment {
+    PHX_CI_STATE_DIR = '.purplephx-ci'
+    PHX_ARTIFACT_DIR = '.purplephx/ci-artifacts'
+    PHX_REPO_NAME = "${env.JOB_BASE_NAME}"
+    PHX_API_KEY = credentials('phx-api-key')
+  }
+
+  stages {
+    stage('Analyze') {
+      steps {
+        sh 'bash scripts/purple ci analyze "${PHX_REPO_NAME}"'
+      }
+    }
+
+    stage('Scan') {
+      steps {
+        sh 'bash scripts/purple ci scan STANDARD_ASSESSMENT "${PHX_REPO_NAME}"'
+      }
+    }
+
+    stage('Retrieve Results') {
+      steps {
+        sh 'bash scripts/purple ci fetch-results "${PHX_REPO_NAME}" SESSION_END'
+      }
+    }
+
+    stage('Export Results') {
+      steps {
+        sh '''
+          mkdir -p "${PHX_ARTIFACT_DIR}"
+          bash scripts/purple ci export-results markdown "${PHX_ARTIFACT_DIR}"
+          cp "${PHX_CI_STATE_DIR}/latest.json" "${PHX_ARTIFACT_DIR}/raw-response.json"
+        '''
+      }
+    }
+
+    stage('Policy Gate') {
+      steps {
+        sh 'bash scripts/purple ci fail-on-policy "${PHX_ARTIFACT_DIR}/summary.json" 0 5'
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: '.purplephx/ci-artifacts/**, .purplephx-ci/**', allowEmptyArchive: true
+    }
+  }
+}

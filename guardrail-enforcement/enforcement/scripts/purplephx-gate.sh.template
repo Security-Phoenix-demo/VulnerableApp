@@ -1,0 +1,2351 @@
+#!/usr/bin/env bash
+# Purplephx PreToolUse GATE hook — the only enforcement surface in this pack that can block.
+#
+# Design: docs/plans/2026-09-10-purple-session-enforcement-design.md (sections cited inline).
+# Unlike the SessionEnd hook (which cannot block — Claude Code ignores its exit code), a
+# PreToolUse hook's exit code 2 DOES block the tool call. Everything in this file is written so
+# that the gate either blocks deliberately or SKIPS LOUDLY. It must never fabricate a pass.
+#
+# THE FAILURE SHAPE THIS FILE EXISTS TO AVOID is a control that installs, reports itself active,
+# and permits everything. Three concrete ways that happens here, all guarded below:
+#
+#   1. A regex written with the PCRE shorthands `\s` / `\b`. Bash's `[[ =~ ]]` compiles POSIX ERE
+#      via regcomp(3), which does not support them: the pattern simply never matches, and a
+#      non-match is an `exit 0`. Every `git commit` and `git push` would be allowed by a gate that
+#      logs itself as installed. The three patterns below use `[[:space:]]` ONLY. Do not "tidy"
+#      them (design section 9, AC-P3-10, Global Constraint 11).
+#   2. A receipt-validity test joined with `||` instead of `&&`. All four conditions of design
+#      section 9 "Receipt" are evaluated in ONE jq boolean expression (phx_receipt_is_valid) so
+#      there is no shell short-circuit to get wrong.
+#   3. A budget computed once and never re-checked. `phx_budget_ok` is called before EVERY network
+#      step and inside the poll loop; the gate decides its own skip rather than being killed by the
+#      hook's outer timeout, which would discard its output entirely (design section 6.4, F11).
+#
+# Repository-mutation-free (design section 14 rule 5, AC-P3-12): no `git add`, no `git fetch`, no
+# index write, no ref write. The only writes are `<repo>/.purplephx/receipts/` (gitignored by the
+# installer) and `~/.phoenix/` (outside every repository). All of them are
+# write-to-temp-then-atomic-`mv` inside the same directory. No locks anywhere (a lock in a
+# PreToolUse hook turns contention into a stalled hook, and a stalled hook does not block).
+#
+# `set -e` is deliberately NOT used, matching purplephx-session-end.sh. Under `set -e` any
+# unexpected non-zero status exits the script with status 1, which Claude Code treats as a
+# non-blocking hook error — i.e. the gate would silently stop gating on an unrelated hiccup. Every
+# exit here goes through phx_finish, which writes the observability line first.
+set -uo pipefail
+
+PHX_GATE_VERSION="purplephx-gate/1.0.0"
+
+# ---------------------------------------------------------------------------
+# 1. Stdin contract and early exits (design section 6.1, AC-P3-11)
+#
+# Read stdin ONCE. Exactly five fields are read and the rest of the payload is ignored.
+# `session_id` is read ONLY to stamp the skip record and the log line (section 6.1) — it never
+# authorizes anything. `tool_input.command` is model-authored: it is REGEX-MATCHED ONLY, never
+# eval'd, never interpolated into another command, and never passed to git as an argument (F6).
+#
+# AC-P3-11 requires that a non-Bash tool costs nothing: no network call AND no file written. So
+# these two checks run before anything creates a directory, opens the log, or reads config.
+# ---------------------------------------------------------------------------
+phx_stdin="$(cat)"
+
+# ---------------------------------------------------------------------------
+# 0. Required-binary precondition (C1 fix, review round 1).
+#
+# If `jq` is missing, EVERY subsequent `jq` call in this script exits non-zero and is swallowed by
+# its own `2>/dev/null`, so every guard downstream sees an empty string and takes the "no decision"
+# branch — a silent no-op toward allow, which is the exact failure shape this whole file exists to
+# avoid (see the header comment). `curl` (no policy fetch, no scan) and `git` (no diff, no base, no
+# receipt check) are equally load-bearing. This check therefore runs BEFORE the first `jq`
+# invocation on line below, and it hand-writes its own JSON rather than calling `jq` — `jq` may be
+# exactly the tool that is missing.
+#
+# This is a genuine operational fault, not a gate decision the model needs to weigh, so — unlike
+# every other exit-0 path in this file — it is reported on STDERR (design section 6.2 says stderr
+# on exit 0 reaches only the debug log, which is precisely who this message is for: the operator
+# who installed the pack, not Claude) and it still writes the gate.log line so the failure is never
+# silent, per AC-P3-9's "an absent line is itself the failure signal" doctrine applied one step
+# earlier than backend-unreachable.
+# ---------------------------------------------------------------------------
+phx_missing_bins=""
+command -v jq   >/dev/null 2>&1 || phx_missing_bins="${phx_missing_bins}jq "
+command -v curl >/dev/null 2>&1 || phx_missing_bins="${phx_missing_bins}curl "
+command -v git  >/dev/null 2>&1 || phx_missing_bins="${phx_missing_bins}git "
+if [ -n "$phx_missing_bins" ]; then
+  printf '[purplephx] MISSING DEPENDENCY: %s- gate skipped. Without these tools no policy can be read and no scan can run, so NOTHING about this command has been verified. Install them (or put them on PATH) to restore enforcement.\n' "$phx_missing_bins" >&2
+  phx_pre_home_dir="${PHX_HOME:-$HOME/.phoenix}/enforcement-policy"
+  phx_pre_log_file="$phx_pre_home_dir/gate.log"
+  mkdir -p "$phx_pre_home_dir" 2>/dev/null || true
+  if [ -f "$phx_pre_log_file" ]; then
+    phx_pre_log_size="$(wc -c < "$phx_pre_log_file" 2>/dev/null | tr -d ' ')"
+    case "$phx_pre_log_size" in ''|*[!0-9]*) phx_pre_log_size=0 ;; esac
+    [ "$phx_pre_log_size" -gt 1048576 ] && mv -f "$phx_pre_log_file" "$phx_pre_log_file.1" 2>/dev/null
+  fi
+  phx_pre_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  printf '{"ts":"%s","event":"purplephx.gate.decision","gateVersion":"%s","gate":"unknown","mode":"UNKNOWN","verdict":"skip","reason":"backend_unreachable","policySource":"none","policyAgeSeconds":-1,"durationMs":0,"newFindings":0,"diffHash":"","baseRung":"","jobId":"","workspaceId":"","sessionId":"","skipReason":"missing_dependency"}\n' \
+    "$phx_pre_ts" "$PHX_GATE_VERSION" >> "$phx_pre_log_file" 2>/dev/null
+  exit 0
+fi
+
+# A payload that is not valid JSON cannot be acted on at all: we do not know the tool, the command
+# or the repository. jq exits non-zero and prints nothing, so the guard below sees empty strings
+# and returns 0 without output — the same "no decision, normal permission flow applies" result as
+# a non-matching command.
+# One jq call for the two fields the early exits need. The separator is `|` rather than a literal
+# tab because an invisible delimiter in a committed script is one a code review cannot check;
+# neither `hook_event_name` nor `tool_name` can contain it (both are fixed Claude Code identifiers).
+phx_head="$(printf '%s' "$phx_stdin" | jq -r '[(.hook_event_name // ""), (.tool_name // "")] | join("|")' 2>/dev/null)"
+phx_hook_event="${phx_head%%|*}"
+phx_tool_name="${phx_head##*|}"
+
+[ "$phx_hook_event" = "PreToolUse" ] || exit 0
+[ "$phx_tool_name" = "Bash" ] || exit 0
+
+phx_command="$(printf '%s' "$phx_stdin" | jq -r '.tool_input.command // ""' 2>/dev/null)"
+phx_cwd="$(printf '%s' "$phx_stdin" | jq -r '.cwd // ""' 2>/dev/null)"
+phx_session_id="$(printf '%s' "$phx_stdin" | jq -r '.session_id // ""' 2>/dev/null)"
+[ -n "$phx_cwd" ] || phx_cwd="${CLAUDE_PROJECT_DIR:-$PWD}"
+# I4 fix (review round 1): resolve to the git repository's TOPLEVEL once, here, before anything
+# downstream (PHX_RECEIPT_DIR, PHX_SKIP_DIR, every diff/diffHash git call) is built from `phx_cwd`.
+# `cwd` can be a subdirectory of the repository (Claude Code reports the tool's working directory,
+# not the repo root), and a receipt written under a subdirectory's `.purplephx/receipts/` lands
+# outside the installer's `.gitignore` scope (T5) and a later `gate`-mode run from a DIFFERENT
+# subdirectory of the SAME repo would miss it — a diffHash that is genuinely on disk reads as
+# "no receipt". A `phx_cwd` that is not inside a git work tree at all is left unresolved here (the
+# `git rev-parse --show-toplevel` call below simply fails and prints nothing): the existing
+# "not a git working tree" check further down still catches that case and skips before
+# PHX_RECEIPT_DIR is ever read, so there is nothing to duplicate here.
+phx_cwd_toplevel="$(git -C "$phx_cwd" rev-parse --show-toplevel 2>/dev/null)"
+[ -n "$phx_cwd_toplevel" ] && phx_cwd="$phx_cwd_toplevel"
+
+# ---------------------------------------------------------------------------
+# 2. Command matching and precedence (design section 9, AC-P3-10, AC-P3-10a)
+#
+# POSIX ERE, character classes only. The pre-subcommand group is `[^[:space:]]+` and NOT
+# `-[^[:space:]]+`: an option that takes a detached value (`git -C /tmp/x commit`, `-c`,
+# `--git-dir`, `--work-tree`) leaves a bare argument between `git` and the subcommand, and the
+# dash-anchored form failed to match it — in the fail-open direction, since a non-match is exit 0.
+#
+# PRECEDENCE: when both commit and push match (`git push origin commit` — a branch or remote
+# literally named `commit`), PUSH WINS. This is derived, not a preference: the push profile scans
+# the branch diff, a strict superset of the commit profile's staged diff, and during a push the
+# staged diff is normally EMPTY — so letting commit win would scan nothing and report clean on
+# nothing. AC-P3-10a is the literal test.
+#
+# `gh pr create` runs the PUSH profile (branch diff), per the section 4 trigger map.
+#
+# C2 FIX (review round 1, AC-P3-10). The anchor previously accepted only `^` (absolute start of
+# string) or one of `;&|` as the character directly before `git`/`gh`. Three real shapes did not
+# match, all in the fail-CLOSED direction (a non-match is `exit 0` — no scan):
+#   * leading whitespace before the whole command (` git commit -m x`),
+#   * a newline-separated multi-command string with `git push` on its own line (no `;`/`&`/`|`
+#     immediately precedes it — only a bare newline does),
+#   * an env-var-prefixed command (`FOO=1 git push` — AC-P3-10 names this exact case).
+# The boundary now also accepts a bare newline as a separator (embedded as a literal byte via
+# `$'\n'`, never the PCRE `\n` escape — bracket expressions are POSIX character LISTS, not escape
+# sequences) and optional leading whitespace at the very start, and an optional chain of
+# `VAR=value` assignments is allowed between the boundary and `git`/`gh`. This is strictly a
+# WIDENING: every string the old anchor matched still matches (the old two alternatives are
+# unchanged, and the new var-prefix group is optional with `*`), and generic whitespace was
+# deliberately NOT added as a boundary — `echo git push` must still NOT match (a space alone is not
+# a command separator), and only `;`/`&`/`|`/newline/absolute-start are. Global Constraint 11: only
+# `[[:space:]]`-class POSIX bracket expressions, no `\s`/`\b` PCRE shorthand — verified working on
+# bash 3.2 below (section 3.5 of the fix-round report).
+PHX_NL=$'\n'
+PHX_RE_BOUNDARY='(^[[:space:]]*|[;&|'"$PHX_NL"'][[:space:]]*)'
+PHX_RE_VARPREFIX='([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*'
+PHX_RE_COMMIT="${PHX_RE_BOUNDARY}${PHX_RE_VARPREFIX}"'git[[:space:]]+([^[:space:]]+[[:space:]]+)*commit([[:space:]]|$)'
+PHX_RE_PUSH="${PHX_RE_BOUNDARY}${PHX_RE_VARPREFIX}"'git[[:space:]]+([^[:space:]]+[[:space:]]+)*push([[:space:]]|$)'
+PHX_RE_PR="${PHX_RE_BOUNDARY}${PHX_RE_VARPREFIX}"'gh[[:space:]]+pr[[:space:]]+create([[:space:]]|$)'
+
+phx_gate=""
+if [[ "$phx_command" =~ $PHX_RE_PUSH ]]; then
+  phx_gate="push"
+elif [[ "$phx_command" =~ $PHX_RE_PR ]]; then
+  phx_gate="push"
+elif [[ "$phx_command" =~ $PHX_RE_COMMIT ]]; then
+  phx_gate="commit"
+fi
+
+if [ -z "$phx_gate" ]; then
+  # Not a gated command. No output, no network call, no policy fetch — and no log line either,
+  # because the `if: "Bash(git *)"` handler (design section 6.3) can route plenty of non-gated git
+  # commands here and one line per `git status` is noise, not observability.
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Configuration, and what may NOT come out of the repository
+#
+# Four values are baked into the pack at download time and substituted by the installer:
+# https://app.phoenix.security, __PHX_ORG_ID__, __PHX_WORKSPACE_ID__ and the baked fallback policy. The
+# token is NEVER baked (`.claude/rules/client-installable-artifacts.md` R6) — it comes from the
+# environment, exactly as purplephx-session-end.sh reads it.
+#
+# F3-b, re-applied here and load-bearing. Claude Code's `.claude/settings.json` carries an `env`
+# block whose values are EXPORTED INTO EVERY HOOK SUBPROCESS, and that file is repository content
+# that a pull request can change. So for this hook a git-tracked settings file IS "the
+# environment". Two of our settings are downgrade primitives if repository content can set them:
+#
+#   PHX_API_BASE           — retargets where the bearer token is SENT. A hostile PR pointing this
+#                            at its own host exfiltrates the developer's Phoenix credential and
+#                            can answer with `mode: ADVISORY` to disable blocking at the same time.
+#   PHX_GATE_TIMEOUT_SECONDS — raising it past the hook's real `timeout` makes the gate believe it
+#                            has budget it does not have, so it is KILLED mid-flight; a killed hook
+#                            has its output discarded and does not block (section 6.4, F11). That
+#                            is a silent off switch written in a tracked file.
+#   PHX_API_TOKEN          — a credential in repository content is a leak regardless of who wins.
+#
+# The test is "is this name DECLARED by any project-local file", not "is that file tracked": an
+# untracked file can be `git add`-ed into a PR at any time, so treating only tracked files as
+# hostile fails OPEN on the unstaged rehearsal of the same attack. The trusted source is anything
+# OUTSIDE the project — the developer's own shell, or a user-level ~/.claude/settings.json.
+# Plain string search only: these files are repository content and are never parsed or sourced.
+# ---------------------------------------------------------------------------
+PHX_BAKED_API_BASE="https://app.phoenix.security"
+PHX_BAKED_ORG_ID="__PHX_ORG_ID__"
+PHX_BAKED_WORKSPACE_ID="__PHX_WORKSPACE_ID__"
+# Baked fallback policy (design section 5 hard defaults). Substituted at download time; the literal
+# placeholders below are the section 5 defaults themselves, so an unsubstituted pack is advisory.
+PHX_BAKED_MODE="__PHX_POLICY_MODE__"
+PHX_BAKED_BLOCKING_SEVERITIES="__PHX_POLICY_BLOCKING_SEVERITIES__"
+PHX_BAKED_COMMIT_DOMAINS="__PHX_POLICY_COMMIT_DOMAINS__"
+PHX_BAKED_PUSH_DOMAINS="__PHX_POLICY_PUSH_DOMAINS__"
+
+phx_unsubstituted() { case "$1" in __*__) return 0 ;; *) return 1 ;; esac; }
+
+phx_declared_locally() { # <VAR_NAME> -> prints the offending file and returns 0 when found
+  local phx_dl_f
+  for phx_dl_f in "$phx_cwd"/.claude/settings*.json "$phx_cwd"/.purplephx/session.env; do
+    [ -f "$phx_dl_f" ] || continue
+    if grep -q "$1" "$phx_dl_f" 2>/dev/null; then
+      printf '%s\n' "$phx_dl_f"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Written out per variable rather than via an `eval "$1=..."` indirection. This script is the one
+# place in the pack that reads model-authored text, so it carries NO `eval` at all — not even one
+# whose argument is a hardcoded literal, because the next editor to add a third variable is the
+# person who would make it dynamic.
+phx_refusals=""
+phx_refusal_src=""
+# I5 fix (review round 1): a REFUSED token (a security decision — the value was declared in
+# repository content) must never be reported downstream as "not set" (a configuration omission).
+# This flag lets the later precondition check give the developer the correct, distinct message.
+phx_api_token_refused=0
+if phx_refusal_src="$(phx_declared_locally PHX_API_BASE)"; then
+  phx_refusals="${phx_refusals}PHX_API_BASE (declared in ${phx_refusal_src}); "
+  PHX_API_BASE=""
+fi
+if phx_refusal_src="$(phx_declared_locally PHX_API_TOKEN)"; then
+  phx_refusals="${phx_refusals}PHX_API_TOKEN (declared in ${phx_refusal_src}); "
+  PHX_API_TOKEN=""
+  phx_api_token_refused=1
+fi
+# PHX_GATE_TIMEOUT_SECONDS is deliberately NOT in that refusal list, and is handled by a
+# lower-only clamp in section 4 instead. The hook wiring itself lives in `.claude/settings.json`,
+# so a declaration-based refusal would fire on the pack's own correct installation. A clamp closes
+# the same hole structurally: only a RAISE is dangerous (it makes the gate believe it has budget it
+# does not have, so it is killed mid-flight and renders no decision), and a raise is impossible.
+
+PHX_API_BASE="${PHX_API_BASE:-}"
+if [ -z "$PHX_API_BASE" ]; then
+  if phx_unsubstituted "$PHX_BAKED_API_BASE"; then
+    PHX_API_BASE="http://localhost:4250"
+  else
+    PHX_API_BASE="$PHX_BAKED_API_BASE"
+  fi
+fi
+
+PHX_API_TOKEN="${PHX_API_TOKEN:-}"
+PHX_ORG_ID="${PHX_ORG_ID:-}"
+if [ -z "$PHX_ORG_ID" ] && ! phx_unsubstituted "$PHX_BAKED_ORG_ID"; then PHX_ORG_ID="$PHX_BAKED_ORG_ID"; fi
+PHX_WORKSPACE_ID="${PHX_WORKSPACE_ID:-}"
+if [ -z "$PHX_WORKSPACE_ID" ] && ! phx_unsubstituted "$PHX_BAKED_WORKSPACE_ID"; then PHX_WORKSPACE_ID="$PHX_BAKED_WORKSPACE_ID"; fi
+PHX_REPO_NAME="${PHX_REPO_NAME:-$(basename "$phx_cwd")}"
+
+# The policy cache is keyed by org AND workspace (design section 8, F8). A pack downloaded at org
+# grain has no workspace, and the literal `org-default` is that case's key — never an empty path
+# segment, which would collapse two different cache scopes onto one file.
+phx_org_key="${PHX_ORG_ID:-org-default}"
+phx_ws_key="${PHX_WORKSPACE_ID:-org-default}"
+PHX_HOME_DIR="${PHX_HOME:-$HOME/.phoenix}/enforcement-policy"
+PHX_CACHE_DIR="$PHX_HOME_DIR/$phx_org_key"
+PHX_CACHE_FILE="$PHX_CACHE_DIR/$phx_ws_key.json"
+PHX_LOG_FILE="$PHX_HOME_DIR/gate.log"
+PHX_RECEIPT_DIR="$phx_cwd/.purplephx/receipts"
+PHX_SKIP_DIR="$PHX_RECEIPT_DIR/skips"
+
+# ---------------------------------------------------------------------------
+# 4. Internal budget (design section 6.4, F11, AC-P3-9)
+#
+# The configured hook `timeout` is 30 for commit and 180 for push (section 6.4 item 2); the gate's
+# own budget is that value MINUS 10 seconds of margin. The gate must always decide within its own
+# budget: a hook killed at its outer timeout has its output DISCARDED, renders no decision, and
+# does not block — and it writes no log line, which is why AC-P3-9 asserts the PRESENCE of a line
+# rather than only its timing. An absent line is itself the failure signal.
+# ---------------------------------------------------------------------------
+phx_default_timeout=30
+[ "$phx_gate" = "push" ] && phx_default_timeout=180
+phx_timeout_cfg="${PHX_GATE_TIMEOUT_SECONDS:-$phx_default_timeout}"
+# The digit-LENGTH check is load-bearing, not belt-and-braces (same reasoning as
+# purplephx-session-end.sh's phx_clamp_seconds): an all-digit but oversized value passes the
+# `case` and then every `[ -lt ]` below FAILS with "integer expression expected", and a failing
+# `[` makes the `if` false, which hands the caller's value straight back unclamped.
+case "$phx_timeout_cfg" in ''|*[!0-9]*) phx_timeout_cfg="$phx_default_timeout" ;; esac
+[ "${#phx_timeout_cfg}" -gt 4 ] && phx_timeout_cfg="$phx_default_timeout"
+# LOWER-ONLY. A value above this profile's configured hook timeout is refused, because believing
+# in budget the hook does not have gets the gate KILLED, and a killed hook has its output discarded
+# and does not block (section 6.4, F11) -- a silent off switch. A value below is always safe: the
+# gate simply decides its own skip sooner.
+[ "$phx_timeout_cfg" -gt "$phx_default_timeout" ] && phx_timeout_cfg="$phx_default_timeout"
+[ "$phx_timeout_cfg" -lt 15 ] && phx_timeout_cfg=15
+PHX_BUDGET_SECONDS=$(( phx_timeout_cfg - 10 ))
+[ "$PHX_BUDGET_SECONDS" -lt 5 ] && PHX_BUDGET_SECONDS=5
+
+phx_now_epoch() { date -u +%s; }
+PHX_START_EPOCH="$(phx_now_epoch)"
+PHX_BUDGET_END=$(( PHX_START_EPOCH + PHX_BUDGET_SECONDS ))
+
+phx_remaining() { echo $(( PHX_BUDGET_END - $(phx_now_epoch) )); }
+# Re-evaluated before EVERY network step and on every poll iteration. Computing this once at start
+# and trusting it later is the third silent-failure shape named in this file's header.
+phx_budget_ok() { [ "$(phx_remaining)" -ge "${1:-1}" ]; }
+# Every network call's client-side deadline is the REMAINING budget minus a 2-second reserve, so
+# that when a call does time out the gate still has time left to write its skip record and its log
+# line. Handing curl the full remaining budget looks equivalent and is not: the gate would come
+# back at exactly zero and race its own outer hook timeout, and a killed hook writes NO log line at
+# all — the absent-line failure signal AC-P3-9 exists to catch.
+phx_call_deadline() {
+  local phx_cd; phx_cd=$(( $(phx_remaining) - 2 ))
+  [ "$phx_cd" -lt 1 ] && phx_cd=1
+  echo "$phx_cd"
+}
+
+phx_iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+phx_iso_at() { # <epoch>
+  date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null
+}
+phx_iso_to_epoch() { # <iso8601> -> epoch, or nothing when unparseable (BSD then GNU)
+  date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$1" +%s 2>/dev/null || date -u -d "$1" +%s 2>/dev/null
+}
+# durationMs has one-second resolution wherever `date` has no `%3N` (BSD/macOS). Stated rather
+# than faked: AC-P3-9 reads `durationMs < 20000`, which one-second resolution answers correctly.
+phx_duration_ms() { echo $(( ( $(phx_now_epoch) - PHX_START_EPOCH ) * 1000 )); }
+
+phx_sha256() { # stdin -> lowercase hex, no filename suffix
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 | awk '{print $1}'
+  else sha256sum | awk '{print $1}'; fi
+}
+
+# A fresh, cryptographically random nonce per invocation
+# (`.claude/rules/untrusted-content-boundary.md` R1). A static or content-derived delimiter can be
+# forged by the very content it is meant to fence; this one cannot, because the repository content
+# was written before the nonce existed.
+PHX_NONCE="$(od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n')"
+[ -n "$PHX_NONCE" ] || PHX_NONCE="$(printf '%s-%s-%s' "$$" "$PHX_START_EPOCH" "$RANDOM" | phx_sha256)"
+
+# ---------------------------------------------------------------------------
+# 5. Sanitiser (F7, AC-P3-1/AC-P3-4; `.claude/rules/untrusted-content-boundary.md` R1)
+#
+# These are GuardrailGeneratorService's own sanitize() rules, not a second sanitiser invented
+# here: strip bidi-override / zero-width / BOM / C0-C1 control characters (keeping tab, LF and CR,
+# exactly as its controlCharsRegex does), neutralise backticks to `'`, redact the same six
+# dangerous executable patterns, and bound the length at maxSnippetLen = 4000 (inline positions at
+# maxInlineLen = 300, newlines collapsed and trimmed).
+#
+# ONE DELIBERATE, DISCLOSED DEVIATION: the Kotlin original NFKC-normalises first. There is no
+# portable NFKC in `jq`/POSIX shell and this pack does not depend on Python, so that step is
+# absent here. It is a normalisation step, not one of the containment steps — the codepoint strip,
+# the backtick neutralisation, the redaction and the length cap all still apply — but it is named
+# here rather than left for a reader to assume parity.
+#
+# The codepoint filter is written numerically via explode/implode rather than as a regex character
+# class on purpose: a class containing literal U+200B / U+202E is invisible in a diff and a code
+# review cannot see whether it is right.
+# ---------------------------------------------------------------------------
+PHX_JQ_SANITIZE='
+def phx_strip_ctrl:
+  explode
+  | map(select((. > 31 or . == 9 or . == 10 or . == 13)
+               and . != 127
+               and (. < 8203 or . > 8207)
+               and (. < 8234 or . > 8238)
+               and (. < 8294 or . > 8297)
+               and . != 65279))
+  | map(if . == 96 then 39 else . end)
+  | implode;
+def phx_redact:
+    gsub("eval\\("; "/* REDACTED */")
+  | gsub("exec\\("; "/* REDACTED */")
+  | gsub("System\\.exit"; "/* REDACTED */")
+  | gsub("Runtime\\.getRuntime"; "/* REDACTED */")
+  | gsub("ProcessBuilder"; "/* REDACTED */")
+  | gsub("rm -rf"; "/* REDACTED */");
+def phx_defence: gsub("untrusted-data"; "untrusted_data");
+def phx_sanitize: ((. // "") | tostring) | phx_strip_ctrl | phx_redact | phx_defence | .[0:4000];
+def phx_inline: phx_sanitize | gsub("[\r\n]+"; " ") | sub("^[ \t]+"; "") | sub("[ \t]+$"; "") | .[0:300];
+'
+
+# ---------------------------------------------------------------------------
+# 6. Atomic writes (design section 14 rule 2) — temp file in the SAME directory, then `mv`.
+# ---------------------------------------------------------------------------
+phx_atomic_write() { # <target-path>  (content on stdin)
+  local phx_target="$1" phx_dir phx_tmp
+  phx_dir="$(dirname "$phx_target")"
+  mkdir -p "$phx_dir" 2>/dev/null || return 1
+  phx_tmp="$(mktemp "$phx_dir/.phxtmp.XXXXXX" 2>/dev/null)" || return 1
+  cat > "$phx_tmp" 2>/dev/null || { rm -f "$phx_tmp" 2>/dev/null; return 1; }
+  mv -f "$phx_tmp" "$phx_target" 2>/dev/null || { rm -f "$phx_tmp" 2>/dev/null; return 1; }
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# 7. Observability (design section 15.1)
+#
+# One structured line per invocation, appended to ~/.phoenix/enforcement-policy/gate.log, rotated
+# at 1 MiB with two generations. NEVER written to stderr on the exit-0 path: stderr there reaches
+# only the debug log (section 6.2), so the file is the durable artefact.
+#
+# Closed value sets, so the log is countable without parsing prose:
+#   verdict      allow | deny | skip
+#   reason       not_matched | no_findings | new_findings | no_receipt | receipt_expired |
+#                receipt_policy_mismatch | backend_unreachable | budget_expired | policy_disabled |
+#                policy_unavailable
+#   policySource server | cache | baked | none
+#
+# `skipReason` is an ADDITIVE field carrying the precise cause where the closed `reason` set has no
+# exact member (the design's own section 9 rung-4 `SKIP_NO_BASE` is such a case). The closed set is
+# never extended; it is `reason` that stays countable, and `skipReason` that stays honest.
+# ---------------------------------------------------------------------------
+phx_policy_source="none"
+phx_policy_age_seconds=-1
+phx_policy_mode="ADVISORY"
+phx_policy_blocking='[]'
+phx_policy_domains='["SAST","SECRETS"]'
+phx_policy_updated_at=""
+# Phase 6 T7 (design section 17.6.3) — the BACKEND provenance field ("source" in the fetched JSON:
+# WORKSPACE_ROW / ORG_ROW / SYSTEM_DEFAULT / EXCEPTION_APPLIED). Deliberately a DIFFERENT variable
+# from phx_policy_source above, which means something else entirely (server/cache/baked — WHERE
+# this invocation's policy JSON came from). Conflating the two would silently corrupt the
+# server/cache/baked ladder this section already implements.
+phx_policy_resolved_source=""
+phx_policy_exception_id=""
+phx_policy_exception_granted_by=""
+phx_policy_exception_requested_by=""
+phx_policy_exception_expires_at=""
+phx_diff_hash=""
+phx_base_rung=""
+phx_base_sha=""
+phx_head_sha=""
+phx_new_findings=0
+phx_scan_job_id=""
+
+phx_write_log() { # <verdict> <reason> <skipReason>
+  mkdir -p "$PHX_HOME_DIR" 2>/dev/null || return 0
+  if [ -f "$PHX_LOG_FILE" ]; then
+    local phx_size
+    phx_size="$(wc -c < "$PHX_LOG_FILE" 2>/dev/null | tr -d ' ')"
+    case "$phx_size" in ''|*[!0-9]*) phx_size=0 ;; esac
+    if [ "$phx_size" -gt 1048576 ]; then
+      mv -f "$PHX_LOG_FILE" "$PHX_LOG_FILE.1" 2>/dev/null || true
+    fi
+  fi
+  jq -cn \
+    --arg ts "$(phx_iso_now)" \
+    --arg gv "$PHX_GATE_VERSION" \
+    --arg gate "$phx_gate" \
+    --arg mode "$phx_policy_mode" \
+    --arg verdict "$1" \
+    --arg reason "$2" \
+    --arg skipReason "$3" \
+    --arg policySource "$phx_policy_source" \
+    --argjson policyAgeSeconds "$phx_policy_age_seconds" \
+    --argjson durationMs "$(phx_duration_ms)" \
+    --argjson newFindings "$phx_new_findings" \
+    --arg diffHash "$phx_diff_hash" \
+    --arg baseRung "$phx_base_rung" \
+    --arg jobId "$phx_scan_job_id" \
+    --arg workspaceId "$PHX_WORKSPACE_ID" \
+    --arg sessionId "$phx_session_id" \
+    '{ts:$ts,event:"purplephx.gate.decision",gateVersion:$gv,gate:$gate,mode:$mode,
+      verdict:$verdict,reason:$reason,policySource:$policySource,
+      policyAgeSeconds:$policyAgeSeconds,durationMs:$durationMs,newFindings:$newFindings,
+      diffHash:$diffHash,baseRung:$baseRung,jobId:$jobId,
+      workspaceId:$workspaceId,sessionId:$sessionId}
+     | if $skipReason == "" then . else . + {skipReason:$skipReason} end' \
+    >> "$PHX_LOG_FILE" 2>/dev/null || true
+  # Violation telemetry (design section 17.7, T7). Every line this function writes to gate.log is
+  # ALSO evaluated for the local violation queue — same (verdict, reason, skipReason) triple, one
+  # choke point, so no call site of phx_finish_allow/phx_finish_skip/phx_finish_deny (or the direct
+  # phx_write_log call inside phx_tip_commit_fallback) can forget to queue. See phx_violation_kind_for
+  # immediately below for which triples are violations at all.
+  local phx_wl_kind
+  phx_wl_kind="$(phx_violation_kind_for "$1" "$2" "$3")"
+  [ -n "$phx_wl_kind" ] && phx_queue_violation "$phx_wl_kind" "$2" "$3"
+}
+
+# ---------------------------------------------------------------------------
+# 7b. Violation telemetry — local queue (design section 17.7, T7 brief)
+#
+# "A skip IS a policy violation" (design section 17.7 — the product owner's framing, quoted in the
+# design doc: the gate does not emit "skips" into a counter, it emits *violations*, of which a skip
+# is one kind). Every DENY and every SKIP this gate reaches is queued locally, one ndjson line per
+# violation, under ~/.phoenix/enforcement-policy/<org>/<workspaceId>/violation-queue.ndjson, and
+# flushed to the backend by phx_flush_violation_queue (section 10 below) on the next invocation that
+# successfully reaches the policy-fetch step — the bootstrap paradox named in design section 15.3: a
+# violation caused by an unreachable backend cannot be posted while the backend is unreachable.
+#
+# `not_matched` on its own is NOT a violation (nothing could be scanned at all — e.g. not a git
+# working tree, or a command the gate never matched) and must NOT be queued. But the D4 "no push
+# base" loud skip is ALSO logged with reason=not_matched, because section 15.1's closed `reason` set
+# has no separate member for it — and that ONE is a violation the design explicitly requires this
+# table to count ("SKIP_NO_BASE is the D4 skip... this table is where it is counted", design section
+# 17.7.1). The two are told apart by `skipReason` (no_push_base / no_merge_base), checked FIRST,
+# below, before the generic not_matched exclusion applies to anything else.
+#
+# EXCEPTION_APPLIED has no mapping here, deliberately, and this remains true now that Phase 6's
+# exception mechanism has shipped (T7): this function answers "did this invocation's OUTCOME count
+# as a violation" (verdict/reason/skipReason), while EXCEPTION_APPLIED is a distinct,
+# always-fires-when-true signal about policy PROVENANCE, orthogonal to outcome — it fires once per
+# invocation whenever the resolved policy came from a live exception, independent of whatever
+# verdict (allow/gate/deny/skip) that invocation otherwise reaches. See the dedicated
+# phx_queue_violation call site, right after policy resolution, below.
+# ---------------------------------------------------------------------------
+phx_violation_kind_for() { # <verdict> <reason> <skipReason> -> kind on stdout, or nothing at all
+  case "$3" in
+    no_push_base|no_merge_base) printf 'SKIP_NO_BASE'; return 0 ;;
+  esac
+  case "$1" in
+    deny) printf 'BLOCKED'; return 0 ;;
+  esac
+  # F2 fix: the reason-based mapping below is gated on the verdict ACTUALLY being "skip". Matching
+  # on $2 alone (without checking $1) let an ALLOW verdict be queued as a violation whenever its
+  # `reason` string happened to collide with a skip-only reason — concretely, section 16's kill
+  # switch soft-off path calls `phx_finish_allow "policy_disabled" ...` (an ALLOW, by design: "a
+  # soft-off is a soft-off, not a skip and not a block"), and without this guard every command run
+  # after an org disables enforcement was logged backwards, as a SKIP_NO_POLICY violation.
+  if [ "$1" = "skip" ]; then
+    case "$2" in
+      backend_unreachable) printf 'SKIP_BACKEND_UNREACHABLE'; return 0 ;;
+      budget_expired) printf 'SKIP_TIMEOUT'; return 0 ;;
+      policy_disabled|policy_unavailable) printf 'SKIP_NO_POLICY'; return 0 ;;
+    esac
+  fi
+  # not_matched (any other skipReason), no_findings, and an allow-verdict new_findings (ADVISORY's
+  # informational report — NOT a BLOCKED outcome, since the gate did not actually deny anything) all
+  # fall through here and print nothing: none of them are violations per section 17.7's own framing.
+  # Likewise an ALLOW verdict never reaches a violation kind regardless of its `reason` string.
+  return 0
+}
+
+phx_queue_violation() { # <kind> <reason> <skipReason> [bypassExceptionId] [bypassGrantedBy] [bypassRequestedBy]
+  # No per-entry workspaceId, no queue entry. The backend's per-entry workspaceId (and the flush
+  # call's own query-parameter workspaceId) are BOTH required — EnforcementViolationService.ingest's
+  # own KDoc: "there is no org-grain aggregate for violation telemetry" — so an org-only install
+  # (no baked/configured workspace) has nothing valid to write here. Deliberate no-op, not a gap:
+  # there is no queue file such an install could ever successfully flush.
+  [[ "${PHX_WORKSPACE_ID:-}" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || return 0
+  local phx_qv_dir phx_qv_file phx_qv_phase phx_qv_bypass_exception_id phx_qv_bypass_granted_by phx_qv_bypass_requested_by
+  phx_qv_dir="$PHX_HOME_DIR/${phx_org_key:-org-default}/${phx_ws_key:-org-default}"
+  phx_qv_file="$phx_qv_dir/violation-queue.ndjson"
+  phx_qv_phase="$(printf '%s' "$phx_gate" | tr '[:lower:]' '[:upper:]')"
+  # Phase 6 T7 — three new, OPTIONAL, trailing parameters. Every pre-existing call site
+  # (phx_write_log's BLOCKED/SKIP_* dispatch) passes only 3 args, so these default to empty here —
+  # unchanged behaviour for every kind but EXCEPTION_APPLIED. The service REJECTS any non-
+  # EXCEPTION_APPLIED entry that carries a non-null bypass* column, so leaving them empty (never
+  # emitted, see the jq filter below) for every other kind is not merely tidy, it is required.
+  phx_qv_bypass_exception_id="${4:-}"
+  phx_qv_bypass_granted_by="${5:-}"
+  phx_qv_bypass_requested_by="${6:-}"
+  mkdir -p "$phx_qv_dir" 2>/dev/null || return 0
+  # Each line is exactly one EnforcementViolationWriteRequest-shaped object — the same shape the
+  # flush's POST body's `violations` array carries, per-entry, minus the wrapping
+  # `{"violations": [...]}` envelope (T7 brief). `workspaceId` is REQUIRED on every entry (T7 brief's
+  # "CORRECTED REQUEST BODY" — the backend's EnforcementViolationService.ingest rejects any entry
+  # whose workspaceId disagrees with the call's own resolved scope, its stated defense-in-depth).
+  # `actorUserId` is left OUT entirely, on every kind including EXCEPTION_APPLIED: the CLI bearer's
+  # OrgContext.userId is "external-token:<id>", not a parseable UUID, and synthesizing a fake
+  # per-developer identity would be worse than an honest gap (T7 brief, established ruling).
+  # bypassExceptionId/bypassGrantedBy/bypassRequestedBy are TOP-LEVEL fields, matching
+  # EnforcementViolationWriteRequest exactly (never nested under `detail`, which is untrusted,
+  # repository-derived free text) — and are only added to the object when non-empty, so a
+  # BLOCKED/SKIP_* entry (which never passes these params) stays byte-identical to before this
+  # change.
+  jq -cn \
+    --arg workspaceId "$PHX_WORKSPACE_ID" \
+    --arg repoIdentifier "${PHX_REPO_NAME:-}" \
+    --arg kind "$1" \
+    --arg gatePhase "$phx_qv_phase" \
+    --arg modeAtEvent "${phx_policy_mode:-ADVISORY}" \
+    --arg occurredAt "$(phx_iso_now)" \
+    --arg reason "$2" \
+    --arg skipReason "$3" \
+    --arg diffHash "${phx_diff_hash:-}" \
+    --arg sessionId "${phx_session_id:-}" \
+    --arg policySource "${phx_policy_source:-none}" \
+    --arg bypassExceptionId "$phx_qv_bypass_exception_id" \
+    --arg bypassGrantedBy "$phx_qv_bypass_granted_by" \
+    --arg bypassRequestedBy "$phx_qv_bypass_requested_by" \
+    '{workspaceId:$workspaceId, repoIdentifier:$repoIdentifier, kind:$kind, gatePhase:$gatePhase,
+      modeAtEvent:$modeAtEvent, occurredAt:$occurredAt,
+      detail:{reason:$reason, skipReason:$skipReason, diffHash:$diffHash, sessionId:$sessionId,
+              policySource:$policySource}}
+     | if $bypassExceptionId == "" then . else . + {bypassExceptionId:$bypassExceptionId} end
+     | if $bypassGrantedBy == "" then . else . + {bypassGrantedBy:$bypassGrantedBy} end
+     | if $bypassRequestedBy == "" then . else . + {bypassRequestedBy:$bypassRequestedBy} end' \
+    >> "$phx_qv_file" 2>/dev/null || true
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# 8. Receipt / skip-record envelope (design section 9 "Receipt")
+# ---------------------------------------------------------------------------
+phx_envelope() { # <verdict> <skipReason> <scanStatus> <bySeverityJson> <detailJson> <baselineSource>
+  local phx_created phx_created_epoch phx_expires_epoch
+  phx_created_epoch="$(phx_now_epoch)"
+  phx_created="$(phx_iso_at "$phx_created_epoch")"
+  phx_expires_epoch=$(( phx_created_epoch + 86400 ))
+  jq -n \
+    --arg diffHash "sha256:$phx_diff_hash" \
+    --arg gate "$phx_gate" \
+    --arg baseRung "$phx_base_rung" \
+    --arg baseSha "$phx_base_sha" \
+    --arg headSha "$phx_head_sha" \
+    --arg createdAt "$phx_created" \
+    --arg expiresAt "$(phx_iso_at "$phx_expires_epoch")" \
+    --argjson expiresAtEpoch "$phx_expires_epoch" \
+    --arg mode "$phx_policy_mode" \
+    --argjson blockingSeverities "$phx_policy_blocking" \
+    --argjson domains "$phx_policy_domains" \
+    --arg source "$phx_policy_source" \
+    --arg policyUpdatedAt "$phx_policy_updated_at" \
+    --arg jobId "$phx_scan_job_id" \
+    --arg scanStatus "$3" \
+    --arg verdict "$1" \
+    --arg skipReason "$2" \
+    --argjson newFindings "$phx_new_findings" \
+    --argjson bySeverity "$4" \
+    --argjson detail "$5" \
+    --arg baselineSource "$6" \
+    --arg gateVersion "$PHX_GATE_VERSION" \
+    --arg sessionId "$phx_session_id" \
+    '{schemaVersion:1,diffHash:$diffHash,gate:$gate,baseRung:$baseRung,baseSha:$baseSha,
+      headSha:$headSha,createdAt:$createdAt,expiresAt:$expiresAt,expiresAtEpoch:$expiresAtEpoch,
+      policy:{mode:$mode,blockingSeverities:$blockingSeverities,domains:$domains,source:$source,
+              policyUpdatedAt:$policyUpdatedAt},
+      scan:{surface:"pr-scan-v1",jobId:$jobId,status:$scanStatus,
+            completedAt:(if $scanStatus == "COMPLETED" then $createdAt else null end)},
+      result:{verdict:$verdict,newFindings:$newFindings,bySeverity:$bySeverity,
+              baselineSource:$baselineSource,newFindingsDetail:$detail},
+      gateVersion:$gateVersion,sessionId:$sessionId}
+     | if $skipReason == "" then . else . + {skipReason:$skipReason} end'
+}
+
+PHX_EMPTY_SEVERITY='{"CRITICAL":0,"HIGH":0,"MEDIUM":0,"LOW":0}'
+phx_by_severity="$PHX_EMPTY_SEVERITY"
+phx_new_detail='[]'
+phx_baseline_source="no-baseline-field-on-surface"
+
+phx_write_skip_record() { # <skipReason>
+  local phx_name
+  phx_name="$(phx_iso_now | tr ':' '-')-${phx_session_id:-nosession}.json"
+  phx_envelope "skipped" "$1" "${2:-NOT_RUN}" "$phx_by_severity" "$phx_new_detail" "$phx_baseline_source" \
+    | phx_atomic_write "$PHX_SKIP_DIR/$phx_name" || true
+}
+
+# ---------------------------------------------------------------------------
+# 9. Terminal paths. Every exit in this script goes through one of these three.
+# ---------------------------------------------------------------------------
+#
+# I1 fix (review round 1, design section 6.2): the F3-b refusal announcement (section 10 below)
+# used to be printed to stderr UNCONDITIONALLY, including on the path that ultimately resolves to
+# ADVISORY (an exit-0 allow) — a stderr write on an exit-0 path reaches only the debug log, never
+# Claude, contradicting this file's own "advisory's only channel is stdout" contract (and the
+# general "never stderr on exit 0" rule this section's own header cites for every OTHER exit-0
+# path). All three finish functions below now prepend `$phx_refusal_notice` (set once, in section
+# 10, never printed directly) to whatever they already emit on their own legitimate channel — stdout
+# `additionalContext` for allow/skip, and the pre-existing stderr text for deny (a deny's stderr
+# write is correct and unaffected). When there is no refusal, `$phx_refusal_notice` is empty and
+# every call site behaves byte-identically to before.
+phx_finish_allow() { # <reason> [stdout-context-text]
+  phx_write_log "allow" "$1" ""
+  local phx_fa_ctx="${2:-}"
+  if [ -n "$phx_refusal_notice" ]; then
+    if [ -n "$phx_fa_ctx" ]; then phx_fa_ctx="${phx_refusal_notice}
+${phx_fa_ctx}"
+    else phx_fa_ctx="$phx_refusal_notice"
+    fi
+  fi
+  if [ -n "$phx_fa_ctx" ]; then
+    jq -cn --arg ctx "$phx_fa_ctx" \
+      '{hookSpecificOutput:{hookEventName:"PreToolUse",additionalContext:$ctx}}'
+  fi
+  exit 0
+}
+
+# A loud skip (design section 5 "no scan means no gate", AC-P3-6, AC-P3-9). exit 0, a message on
+# STDOUT (never stderr — stderr on exit 0 reaches nobody), a skip record beside the receipts, and a
+# log line with verdict "skip". It never fabricates a pass and it never denies on ignorance.
+phx_finish_skip() { # <log-reason> <skipReason> <human message>
+  phx_write_skip_record "$2" "${4:-NOT_RUN}"
+  phx_write_log "skip" "$1" "$2"
+  local phx_fs_ctx="$3"
+  [ -n "$phx_refusal_notice" ] && phx_fs_ctx="${phx_refusal_notice}
+${phx_fs_ctx}"
+  jq -cn --arg ctx "$phx_fs_ctx" \
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",additionalContext:$ctx}}'
+  exit 0
+}
+
+# A deny emits BOTH channels (design section 6.2): the JSON supplies the good message, and exit 2
+# guarantees the block survives a JSON defect — a malformed JSON decision alone FAILS OPEN ("the
+# action proceeds"). Exit 2 cannot be overridden by JSON, so there is no ordering hazard.
+phx_finish_deny() { # <reason> <block message>
+  phx_write_log "deny" "$1" ""
+  local phx_fd_msg="$2"
+  [ -n "$phx_refusal_notice" ] && phx_fd_msg="${phx_refusal_notice}
+${phx_fd_msg}"
+  jq -cn --arg reason "$phx_fd_msg" \
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$reason}}'
+  printf '%s\n' "$phx_fd_msg" >&2
+  exit 2
+}
+
+# ---------------------------------------------------------------------------
+# 10. Preconditions that are not "the backend is down"
+# ---------------------------------------------------------------------------
+phx_refusal_notice=""
+if [ -n "$phx_refusals" ]; then
+  # I1 fix: no longer printed directly to stderr here (that fired even on the ADVISORY/exit-0
+  # path). Recorded instead, and threaded onto whichever channel the eventual decision actually
+  # uses (see phx_finish_allow / phx_finish_skip / phx_finish_deny above) — stdout on every exit-0
+  # path, the existing stderr text on deny. The F3-b lesson (a clamp that only speaks when it
+  # clamps leaves a raised ceiling silent) still holds; it is just reported on the correct channel.
+  phx_refusal_notice="[purplephx] REFUSED repository-declared gate settings: ${phx_refusals}"
+fi
+
+if ! git -C "$phx_cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  phx_finish_skip "not_matched" "not_a_git_worktree" \
+    "[purplephx] NOT A GIT WORKING TREE at ${phx_cwd} - gate skipped. No diff could be computed, so nothing was scanned and nothing was verified."
+fi
+
+if [ -z "$PHX_API_TOKEN" ]; then
+  if [ "$phx_api_token_refused" = "1" ]; then
+    # I5 fix (review round 1): the token is empty here BECAUSE it was refused (declared in
+    # repository content, a security decision — see the REFUSED line above), not because nobody
+    # configured it. Reporting the generic "not set" message in this case tells the developer the
+    # wrong thing to fix (they would go look for a missing env var that in fact exists and was
+    # deliberately rejected).
+    phx_finish_skip "backend_unreachable" "api_token_refused_repo_declared" \
+      "[purplephx] BACKEND UNREACHABLE - gate skipped: PHX_API_TOKEN was REFUSED because it is declared in a repository-tracked file (see the REFUSED line above), so the enforcement policy could not be read and no scan ran. This is a security refusal, not a missing credential — move the token to your own shell environment or a user-level config file outside this repository, never a project-local file."
+  fi
+  phx_finish_skip "backend_unreachable" "no_api_token" \
+    "[purplephx] BACKEND UNREACHABLE - gate skipped: PHX_API_TOKEN is not set in this environment, so the enforcement policy could not be read and no scan ran."
+fi
+
+# The token is put into a curl config file read on STDIN (Global Constraint 6 / F2 /
+# `.claude/rules/env-secret-handling.md` R6): it must never appear in argv, where `ps` makes it
+# world-readable and shell history keeps it. The charset check is not cosmetic — it is what makes
+# the quoted config line below unambiguous, and a token containing a quote or a backslash is far
+# more likely to be a mangled paste than a real credential.
+case "$PHX_API_TOKEN" in
+  *[!A-Za-z0-9._-]*)
+    phx_finish_skip "backend_unreachable" "malformed_api_token" \
+      "[purplephx] BACKEND UNREACHABLE - gate skipped: PHX_API_TOKEN contains characters outside [A-Za-z0-9._-] and was refused without being sent."
+    ;;
+esac
+
+phx_curl_config() { printf 'header = "Authorization: Bearer %s"\n' "$PHX_API_TOKEN"; }
+
+# ---------------------------------------------------------------------------
+# 9b. Violation queue flush (design section 17.7.2, T7 brief)
+#
+# Attempted on every invocation whose policy GET (section 11 below) actually got an HTTP answer —
+# `phx_policy_http` non-empty, i.e. the backend was reachable enough to respond at all, regardless
+# of status code or the gate's own eventual verdict. A curl transport failure/timeout on THAT same
+# call leaves `phx_policy_http` empty, and there is no point attempting a POST to a backend this
+# same invocation already found unreachable.
+#
+# CORRECTED ENDPOINT (T7 brief — this is a fix to the design doc's own §17.7.2 text, made after T6
+# shipped: that text names the plain, non-/external/ path, which is browser-session-only and
+# unreachable by this CLI-bearer-only script):
+#
+#   POST /api/v1/external/purplephx/enforcement-violation?workspaceId={uuid}
+#
+# — the exact same /api/v1/external/ prefix and the exact same PHX_API_BASE/token-resolution
+# mechanism as the policy GET a few sections below (`$PHX_API_BASE/api/v1/external/purplephx/
+# enforcement-policy`). Do NOT change this to the plain `/api/v1/purplephx/enforcement-violation`
+# path — that path 404s for a CLI bearer with no browser session and would silently reproduce a
+# defect already found and fixed once this session (see ExternalEnforcementViolationController.kt).
+#
+# Chunked at 200 entries per POST if the queue is large (`.claude/rules/untrusted-content-boundary.md`
+# R4's spirit — a bounded attacker/queue-influenced size axis, never processed unbounded), and
+# budgeted at whatever remains of the gate's own internal budget, hard-capped at 1 second PER CHUNK
+# — this is TELEMETRY, never a second vote on the gate's own verdict (point 3 of the T7 brief): a
+# transport failure here is silently swallowed and retried next invocation, never surfaced, and
+# nothing in this function ever calls `exit` — it always returns, so the exit status the gate's own
+# finish_* function already fixed before this ran (from the EXIT trap, below) is never touched.
+#
+# F1 fix: the remaining-budget check is re-evaluated before EVERY chunk, not once before the loop —
+# the same "re-check before every network step" discipline `phx_budget_ok`'s own header comment
+# (section 4) requires of the gate's main decision path. A deadline computed once and reused across
+# an extended multi-chunk flush (e.g. after a long backend outage left many chunks queued) can let a
+# slow/hanging call on chunk 2+ consume time well past what was budgeted, risking the gate PROCESS
+# itself being killed by the outer hook timeout — which discards its output entirely and fails open
+# (F11, this file's header comment, point 3). Once the actual remaining budget is exhausted the loop
+# bails out (never an error, never touching the exit code) exactly the way an individual chunk's own
+# network failure already does, leaving every not-yet-confirmed-flushed line queued for next time.
+#
+# F3 fix: on exit, EVERY line up to and including the last chunk CONFIRMED flushed is cleared, via
+# one atomic write-to-temp-then-mv (design section 14 rule 2) of the file's CURRENT tail — re-read
+# immediately before that write, not the original snapshot. This queue file is shared across
+# concurrent gate invocations for the same org+workspace (section 14's concurrency model): a
+# DIFFERENT invocation can append a new violation between this function's initial `wc -l` snapshot
+# and its final write, and re-reading right before the write (keeping everything after the
+# confirmed-flushed prefix) is what stops that append from being silently destroyed. The same
+# re-read also preserves any line from the ORIGINAL snapshot that a failed chunk or a budget
+# bailout never got to — a line is removed only once it has actually been POSTed successfully,
+# never because the loop merely reached or passed it.
+#
+# F4 fix (this function's own review-round numbering — NOT design section 13's F4, an unrelated
+# finding about the 900-second session-close hook). F3 above closes ONE flush racing ONE concurrent
+# APPEND. It does not close TWO concurrent FLUSHES of the SAME queue file, which section 14's own
+# concurrency model says is expected ("parallel hook handlers are expected", section 6.5) and this
+# file's own path is shared across every session/repo/worktree for one org+workspace. Concretely:
+# invocation A snapshots N lines, confirms them POSTed, and does `tail -n +(N+1)` — correctly
+# preserving a line appended by a THIRD, concurrent writer after A's snapshot (F3, above). Invocation
+# B, racing A, ALSO snapshots (possibly the same or an overlapping) N lines, ALSO confirms them
+# POSTed (a harmless duplicate send — accepted per this file's own no-locks philosophy, design
+# section 14 rule 4), and then does ITS OWN `tail -n +(N+1)` — but against the file A ALREADY
+# REWROTE, which by then holds only what A's own tail produced. B's tail-of-a-tail truncates against
+# a file shorter than B's own snapshot, and can silently discard whatever A's rewrite left behind —
+# genuine data loss, not a duplicate resend.
+#
+# The fix serializes FLUSH ATTEMPTS (never appends — phx_queue_violation never locks, and must not:
+# nothing may make a PreToolUse hook's own decision path wait on I/O) for one org+workspace queue
+# file with a non-blocking, `mkdir`-based mutual-exclusion directory,
+# `<queue-dir>/.flush.lock` (`mkdir` is the portable atomic "create if absent" primitive on both
+# macOS and Linux, unlike `flock(1)`, which is not universally installed in this pack's target
+# environments). This is deliberately NOT the kind of lock design section 14 rule 4 forbids: rule 4's
+# concern is a lock that can make the gate WAIT and therefore let the outer hook timeout kill it
+# silently (F11) — a blocking primitive. This one never waits: `phx_fq_acquire_flush_lock` either
+# acquires it immediately or returns failure immediately, and a failure means this invocation SKIPS
+# its own flush entirely (the file is left completely untouched, to be retried next invocation or by
+# whichever invocation is already holding the lock) — the exact same "safe to skip, always retried
+# later" shape as every other skip in this function. It is also scoped to exactly one call of
+# phx_flush_violation_queue: acquired at the top of that call, released before it returns, never held
+# across the gate script's own EXIT-trap lifetime (see phx_on_exit's wiring below — it calls this
+# function once, synchronously, and this function's own lock is fully acquired-and-released inside
+# that one call before phx_on_exit's next statement, phx_cleanup, runs).
+#
+# Reclaim mechanism: PID LIVENESS IS PRIMARY, elapsed time is only a narrow defensive fallback.
+#
+# A REVIEW FINDING (Phase 7, post-ship) demonstrated that a PURE TIME-BASED staleness check — this
+# function's original design, "a lock directory older than 30s is abandoned" — is PROVABLY WRONG,
+# reachable via an ordinary backlog-recovery scenario, not a rare edge case: the push-gate profile's
+# own internal budget is 170s by default (`phx_default_timeout=180` for push,
+# `PHX_BUDGET_SECONDS = phx_timeout_cfg - 10 = 170`, section 4 above), and the flush loop
+# (`phx_flush_violation_queue_locked`) has NO independent cap on its own total wall-clock time beyond
+# `phx_remaining` (the gate's OVERALL remaining budget) and how many lines happen to be queued. An
+# extended backend outage can accumulate an uncapped backlog in violation-queue.ndjson, and a
+# push-gate invocation flushing that backlog can legitimately hold this lock for well over 30 real
+# seconds while genuinely still working — one chunk per 200 lines, each its own network round-trip.
+# A racing invocation's OLD time-only check could not tell that apart from a lock abandoned by a
+# process that crashed mid-flush, and would force-reclaim it out from under the still-running
+# holder — reproducing the exact two-concurrent-flush data-loss race (F4, above) this whole lock
+# exists to prevent. (The "each chunk's own network call is hard-capped at 1 second against an
+# internal budget that is itself only a double-digit number of seconds" reasoning the 30s figure was
+# originally justified with does not hold for the push profile at all — its budget is triple-digit,
+# not double-digit — and was the defect.)
+#
+# The fix does not try to guess a bigger, safer time threshold — there isn't a principled one, since
+# the backlog size (and therefore the legitimate hold time) is attacker/outage-influenced and
+# unbounded. Instead, PID LIVENESS is the primary mechanism: on acquire, the holder writes its own
+# pid into `<lock-dir>/pid`; on contention, a racing invocation reads that pid and checks with
+# `kill -0 "$pid"` (POSIX and portable across macOS/BSD and Linux; sends no signal, only tests
+# existence/permission) whether the recorded owner is still alive.
+#   * Owner alive  -> do NOT reclaim, no matter how long the lock has been held. This is the whole
+#     fix: a live flush working through a large backlog is never force-reclaimed just because it is
+#     slow, because "slow" is no longer the signal being tested.
+#   * Owner confirmed dead -> reclaim IMMEDIATELY, with NO time threshold at all. Process death is a
+#     categorically stronger signal than elapsed time, so there is nothing to wait out.
+#   * pid file missing/empty/unreadable (e.g. a lock created by a pre-PID-liveness build of this
+#     script, or a filesystem hiccup reading it) -> fall back to a SHORT elapsed-time staleness
+#     window (`phx_fq_lock_stale_fallback_seconds`, 5s — deliberately short, since it is now only a
+#     defensive backstop for the no-pid-file case, never the primary defence).
+#
+# DISCLOSED RESIDUAL RISK — PID REUSE. Between the recorded owner exiting and this check running,
+# the OS can, in principle, have reused that same pid for an unrelated process, which would make
+# `kill -0` report "alive" for a lock that is in fact abandoned. This is an accepted, narrow residual
+# risk inherent to pid-based liveness checks in shell scripting without a proper process-lock
+# library (flock(1) is not universally installed in this pack's target environments — see the F4
+# rationale below for why this mechanism uses `mkdir` at all). It is not pretended away: the failure
+# direction it produces (skip a flush a little longer than strictly necessary, safe — the file is
+# left untouched either way) is far narrower than the OLD time-based approach's failure direction
+# (force-reclaim a lock a LIVE process still holds, provably reachable via ordinary backlog recovery,
+# genuinely destructive).
+# ---------------------------------------------------------------------------
+
+# FALLBACK ONLY (see above) — used exclusively when the lock's own pid file cannot be read. Short,
+# because it backstops a missing-metadata edge case, not the primary "is the owner still alive"
+# question that PID liveness answers directly. Never reintroduce this as the primary mechanism.
+phx_fq_lock_stale_fallback_seconds=5
+
+# Bound (`.claude/rules/untrusted-content-boundary.md` R4) on the quarantine sidecar F7 writes —
+# rotated at 1 MiB with one generation, the same shape phx_write_log uses for gate.log. A queue
+# corrupted by a runaway writer must never be able to fill the developer's disk through the very
+# mechanism that exists to stop it wedging the flush.
+phx_fq_rejected_max_bytes=1048576
+
+# ---------------------------------------------------------------------------
+# F5 fix (fix round 1) — atomic lock acquisition and OWNERSHIP-CHECKED release.
+#
+# The previous reclaim paths did `rm -rf "$lock"` immediately followed by `mkdir "$lock"`. That is
+# two syscalls, and `rm -f` SUCCEEDS against an already-absent path, so it is not a test-and-set at
+# all: invocation A could observe a dead lock, remove it, re-create it and start flushing, and a
+# racing invocation B — which had observed the SAME dead lock a moment earlier — would then `rm -rf`
+# A's LIVE lock and `mkdir` its own, leaving two concurrent flushes against one queue file. That is
+# exactly the two-concurrent-flush data-loss race (F4, above) the whole lock exists to prevent,
+# reopened by the rm-then-mkdir gap.
+#
+# The fix makes taking an abandoned lock a SINGLE atomic operation: `mv` of the observed lock
+# directory onto a uniquely-named, not-yet-existing sibling path. `rename(2)` is atomic, the source
+# path is gone the instant the winner's rename returns, and every other racer's `mv` therefore fails
+# with ENOENT — so at most ONE invocation can ever take a given lock directory out of the shared
+# path. (`mv` is deliberately NOT used to CREATE the lock: `mv src dir` where `dir` already exists
+# moves `src` INTO it on both BSD and GNU `mv`, which would silently "succeed" without acquiring
+# anything. `mkdir` remains the create-side test-and-set; `mv` is only ever used to take an existing
+# directory AWAY.)
+#
+# Taking is additionally VERIFIED: after the rename, the pid file inside the directory we actually
+# moved is compared against the content we inspected before deciding it was abandoned. A mismatch
+# means a third invocation replaced the lock in the microseconds between our inspection and our
+# rename — we then restore the directory (when the lock path is still free) and skip, rather than
+# proceeding against a lock that may belong to a live process.
+#
+# The same primitive is what RELEASES the lock (phx_fq_release_flush_lock, below), with `$$` as the
+# expected owner. The old release was a bare `rm -rf` with no ownership check at all, so an
+# invocation whose lock had been legitimately force-reclaimed (because it genuinely looked dead)
+# could still, on finally reaching its own release step, delete the NEW rightful holder's lock.
+#
+# DISCLOSED RESIDUAL: if the `printf "$$" > pid` write at acquire time failed (a read-only or full
+# filesystem), the lock's recorded owner is empty, this invocation's own release will not match it,
+# and the lock is left behind — recovered by the next invocation's 5-second no-pid-file fallback
+# rather than held forever. That is the safe direction (a delayed flush, never a double flush).
+#
+# SUPERSEDED IN PART, F9 below: this section's "at most ONE invocation can ever take a given lock
+# directory" claim was found, under sustained 16-way concurrent load, to hold in the COMMON case
+# only — a stale racer's `mv` and the post-move identity check are still two separate syscalls, and
+# a delayed racer landing between them could (reproducibly, ~1-in-20 after the first mitigation
+# below) steal a LIVE holder's directory for a real, third-party-visible window. F8 (the fresh
+# precheck inside `phx_fq_take_lock_dir`, immediately below) narrowed that window; F9 (the `.gate`
+# outer mutex around every entry point that touches this lock) is what actually closes it to zero —
+# read F9's own header comment before touching any of this. Do not remove F8/F9 believing this
+# section's original atomicity claim was sufficient on its own; it measurably was not.
+# ---------------------------------------------------------------------------
+
+phx_fq_take_lock_dir() { # <lock-dir-path> <expected-pid-file-content> -> 0 taken (and removed), 1 not taken
+  local phx_tk="$1" phx_tk_expect="$2" phx_tk_grave phx_tk_found phx_tk_precheck
+
+  # F8 fix (re-review of F5): re-verify FRESH, right here, immediately before the `mv` -- never act
+  # on the caller's `phx_tk_expect` alone, however recently it looks like it was read. The caller
+  # (phx_fq_acquire_flush_lock) reads its snapshot at the TOP of a longer function, then runs a
+  # kill -0 liveness check and several comparisons before ever reaching this call -- long enough,
+  # under real scheduling delay, for a DIFFERENT racer who saw the exact same dead snapshot to have
+  # already reclaimed the lock AND become its new live holder in the meantime. Without this
+  # precheck, this (now-stale) invocation's unconditional `mv` below would steal that LIVE holder's
+  # directory away for a real, observable window -- long enough for a third invocation's top-level
+  # `mkdir` fast path (in phx_fq_acquire_flush_lock's very first branch) to slip in and believe it
+  # acquired a fresh lock, even though the original holder never lost its own belief that it still
+  # holds one. Reproduced directly: 16 concurrent racers on one dead-owner lock, ~50% of runs,
+  # three simultaneous "enter"s with zero intervening "exit"s (final whole-phase re-review).
+  #
+  # This precheck closes the COMMON case (a straggler racer, arbitrarily delayed) by bailing out
+  # BEFORE ever touching the directory -- the straggler's fresh read now sees the CURRENT winner's
+  # live pid, not its own stale expectation, and returns here without any `mv` at all. The
+  # post-move identity check below remains as defense-in-depth for the now-negligible residual
+  # window between THIS check and the `mv` two lines down (two adjacent syscalls, not an unbounded
+  # caller-side delay) -- the same order of magnitude this file already accepts for PID reuse.
+  phx_tk_precheck="$(cat "$phx_tk/pid" 2>/dev/null)"
+  [ "$phx_tk_precheck" = "$phx_tk_expect" ] || return 1
+
+  phx_tk_grave="${phx_tk}.taken.$$.${RANDOM}${RANDOM}"
+  # THE atomic test-and-set. Exactly one racer's rename can succeed; every other racer sees ENOENT.
+  mv "$phx_tk" "$phx_tk_grave" 2>/dev/null || return 1
+  phx_tk_found="$(cat "$phx_tk_grave/pid" 2>/dev/null)"
+  if [ "$phx_tk_found" = "$phx_tk_expect" ]; then
+    rm -rf "$phx_tk_grave" 2>/dev/null || true
+    return 0
+  fi
+  # We moved a DIFFERENT directory than the one we inspected — a third invocation replaced the lock
+  # in the window between the two. Put it back if the slot is still free (never leave a possibly
+  # live holder's lock destroyed), and skip either way.
+  if [ ! -e "$phx_tk" ] && mv "$phx_tk_grave" "$phx_tk" 2>/dev/null; then
+    # A concurrent `mkdir` between the test and the `mv` would have made `mv` nest the directory
+    # inside the new lock instead of restoring it; clear that leftover if it happened.
+    rm -rf "$phx_tk/$(basename "$phx_tk_grave")" 2>/dev/null || true
+  else
+    rm -rf "$phx_tk_grave" 2>/dev/null || true
+  fi
+  return 1
+}
+
+phx_fq_release_flush_lock_inner() { # <lock-dir-path> -- never removes a lock this invocation no longer owns
+  phx_fq_take_lock_dir "$1" "$$" || return 0
+  return 0
+}
+
+# ===========================================================================
+# F9 fix (second re-review of F5) — an outer, whole-decision mutex.
+#
+# The F8 precheck above (re-verify fresh, immediately before the `mv`) shrank the window in which a
+# stale racer could steal a live holder's lock, but did NOT close it: a repeat 20-run stress test of
+# scenario (q) still reproduced the exact mutual-exclusion violation once (5%, down from ~50%
+# before F8) — "enter 42586 enter 42595 exit 42586 exit 42595", two invocations both inside the
+# critical section at once. A `cat` immediately followed by an `mv` is still TWO syscalls, and a
+# process can be preempted by the OS between any two syscalls, however adjacent they look in the
+# source. No amount of narrowing that specific gap closes it to zero.
+#
+# The fix that actually closes it: stop trying to make the multi-step "is it dead, take it,
+# recreate it" decision atomic in pieces, and instead make the WHOLE decision procedure exclusive —
+# wrap it in its own separate, ordinary `mkdir`-based mutex (`<lock>.gate`), the SAME primitive
+# already trusted for the real lock itself. While one invocation holds `.gate`, NO other invocation
+# — reclaiming, releasing, or even the plain "no lock exists yet" fast path — may touch `$phx_lk`'s
+# existence at all: every entry point below acquires `.gate` first. That means the transient
+# absent-window a reclaim's `mv`-away-then-`mkdir`-recreate necessarily creates is now NEVER visible
+# to a third party, because a third party attempting the SAME operation cannot even start it without
+# `.gate`, and there is no other code path in this script that touches `$phx_lk`.
+#
+# Non-blocking, consistent with this whole lock's existing contract: if `.gate` is already held (a
+# concurrent invocation is mid-decision for the SAME lock right this instant — necessarily brief,
+# never a real hold across a whole flush), this invocation simply skips this tick rather than wait.
+# A skipped tick here costs nothing beyond a slightly later flush; skipping was already always a
+# safe outcome everywhere in this file. `.gate` is held only for the short decision procedure, never
+# for the flush itself — `phx_fq_acquire_flush_lock` returns (releasing `.gate`) well before
+# `phx_flush_violation_queue_locked` runs.
+#
+# `.gate` itself would otherwise have exactly the same "held forever" failure mode a lock with no
+# reclaim path has: nothing inside the decision procedure it guards sleeps, blocks on I/O, or
+# reaches the network, so a live holder finishes in milliseconds -- but a crash exactly inside that
+# window would strand `.gate` permanently, wedging every future flush attempt on this workspace.
+# `phx_fq_acquire_gate` gives it the SAME PID-liveness dead-owner reclaim as the real lock (reusing
+# `phx_fq_take_lock_dir`, already correct and tested), PLUS the same `phx_fq_lock_stale_fallback_seconds`
+# time-based fallback for the one sub-case PID-liveness alone cannot cover: an empty/corrupt pid
+# file. An independent re-review of an earlier version of this fix (which omitted the fallback,
+# reasoning "a legitimate hold could look old under a small threshold") reproduced that omission as
+# a genuine, indefinite wedge — `.gate`'s pid write happens microseconds after its own `mkdir` in
+# every non-crashed case, so an empty pid file that has ALSO aged past the threshold is the crash
+# case, not a false positive, and the real lock already accepts an identical fallback for the exact
+# same reason.
+# ===========================================================================
+
+phx_fq_acquire_gate() { # <lock-dir-path> -> 0 acquired .gate, 1 skip (live holder, or genuinely can't tell)
+  local phx_gt="${1}.gate" phx_gt_pid phx_gt_mtime phx_gt_age
+  if mkdir "$phx_gt" 2>/dev/null; then
+    printf '%s' "$$" > "$phx_gt/pid" 2>/dev/null || true
+    return 0
+  fi
+  phx_gt_pid="$(cat "$phx_gt/pid" 2>/dev/null)"
+  case "$phx_gt_pid" in
+    ''|*[!0-9]*)
+      # Re-review finding (independent re-review of F9): an empty/corrupt pid file here — reachable
+      # ONLY via a crash between `.gate`'s `mkdir` succeeding and its `printf` pid write (or a
+      # disk-full write) — was previously NEVER reclaimed: no time-based fallback existed for this
+      # specific sub-case, reproduced as a genuine, indefinite wedge (8+ retries over 16s, still
+      # skipped) even though the identical empty-pid condition on the REAL lock ($phx_lk) already
+      # reclaims via its own 5s fallback. `.gate`'s pid write happens microseconds after its mkdir
+      # in every non-crashed case, so an empty pid file that is ALSO older than the same
+      # `phx_fq_lock_stale_fallback_seconds` threshold the real lock uses is not a "still writing"
+      # false positive — it is the crash case, and is reclaimed the same way.
+      phx_gt_mtime="$(stat -f %m "$phx_gt" 2>/dev/null)"
+      [ -n "$phx_gt_mtime" ] || phx_gt_mtime="$(stat -c %Y "$phx_gt" 2>/dev/null)"
+      case "$phx_gt_mtime" in ''|*[!0-9]*) return 1 ;; esac
+      phx_gt_age=$(( $(phx_now_epoch) - phx_gt_mtime ))
+      [ "$phx_gt_age" -ge "$phx_fq_lock_stale_fallback_seconds" ] || return 1
+      ;;
+    *)
+      kill -0 "$phx_gt_pid" 2>/dev/null && return 1
+      ;;
+  esac
+  phx_fq_take_lock_dir "$phx_gt" "$phx_gt_pid" || return 1
+  mkdir "$phx_gt" 2>/dev/null || return 1
+  printf '%s' "$$" > "$phx_gt/pid" 2>/dev/null || true
+  return 0
+}
+
+phx_fq_release_gate() { # <lock-dir-path> -- always called by the invocation that just acquired .gate
+  rm -rf "${1}.gate" 2>/dev/null || true
+}
+
+phx_fq_release_flush_lock() { # <lock-dir-path> -- serializes against acquire via the SAME .gate mutex
+  phx_fq_acquire_gate "$1" || return 0
+  phx_fq_release_flush_lock_inner "$1"
+  phx_fq_release_gate "$1"
+  return 0
+}
+
+phx_fq_acquire_flush_lock() { # <lock-dir-path> -> 0 acquired, 1 skip (a concurrent invocation holds .gate)
+  local phx_fq_gate_rc
+  phx_fq_acquire_gate "$1" || return 1
+  phx_fq_acquire_flush_lock_inner "$1"
+  phx_fq_gate_rc=$?
+  phx_fq_release_gate "$1"
+  return "$phx_fq_gate_rc"
+}
+
+phx_fq_acquire_flush_lock_inner() { # <lock-dir-path> -> 0 acquired, 1 skip -- ONLY ever called with .gate held
+  local phx_lk="$1" phx_lk_raw phx_lk_pid phx_lk_mtime phx_lk_age
+
+  if mkdir "$phx_lk" 2>/dev/null; then
+    # Record OUR OWN pid as the lock's owner so a racing invocation can ask "is the owner still
+    # alive" instead of guessing from elapsed time, and so our own release can prove the lock it is
+    # about to remove is still ours. Best-effort: a write failure here still leaves the lock
+    # genuinely held — see the DISCLOSED RESIDUAL in the section comment above.
+    printf '%s' "$$" > "$phx_lk/pid" 2>/dev/null || true
+    return 0
+  fi
+
+  # Already held (or the `mkdir` failed for some other reason — e.g. permission — which this
+  # function treats identically to "held", per its own fail-toward-skip contract below). The RAW
+  # file content (not the numerically-validated pid) is what the reclaim below verifies identity
+  # against, so a missing ("") or corrupt ("not-a-pid") pid file is a usable identity too.
+  phx_lk_raw="$(cat "$phx_lk/pid" 2>/dev/null)"
+  phx_lk_pid="$phx_lk_raw"
+  case "$phx_lk_pid" in ''|*[!0-9]*) phx_lk_pid="" ;; esac
+
+  if [ -n "$phx_lk_pid" ]; then
+    if kill -0 "$phx_lk_pid" 2>/dev/null; then
+      # Owner confirmed alive: never reclaim, regardless of how long it has held the lock.
+      return 1
+    fi
+    # Owner confirmed dead: reclaim immediately, no time threshold. Process death is a categorically
+    # stronger signal than elapsed time. The take is atomic and identity-verified (F5) — a racing
+    # invocation that observed the same dead lock loses the rename and skips, so the two can never
+    # both go on to flush.
+    phx_fq_take_lock_dir "$phx_lk" "$phx_lk_raw" || return 1
+    if mkdir "$phx_lk" 2>/dev/null; then
+      printf '%s' "$$" > "$phx_lk/pid" 2>/dev/null || true
+      return 0
+    fi
+    # A different invocation won the race to CREATE the now-free lock — skip rather than contend a
+    # second time; the queue file is untouched either way, so nothing is lost by skipping.
+    return 1
+  fi
+
+  # FALLBACK: no readable pid file. Read the lock directory's age via the same portable
+  # BSD-then-GNU `stat` fallback shape `phx_iso_to_epoch` above already uses for `date`: macOS/BSD
+  # `stat -f %m`, GNU/Linux `stat -c %Y`.
+  phx_lk_mtime="$(stat -f %m "$phx_lk" 2>/dev/null)"
+  [ -n "$phx_lk_mtime" ] || phx_lk_mtime="$(stat -c %Y "$phx_lk" 2>/dev/null)"
+  case "$phx_lk_mtime" in ''|*[!0-9]*) phx_lk_mtime="" ;; esac
+  # Could not read the lock's age at all (it vanished between the failed `mkdir` and this `stat` —
+  # another invocation's own release racing us — or `stat` itself is unavailable/unreadable here).
+  # Fail CLOSED toward skip: never force-reclaim a lock this invocation cannot prove is stale.
+  [ -n "$phx_lk_mtime" ] || return 1
+
+  phx_lk_age=$(( $(phx_now_epoch) - phx_lk_mtime ))
+  [ "$phx_lk_age" -ge "$phx_fq_lock_stale_fallback_seconds" ] || return 1
+
+  # Stale (fallback path, no pid file to check): take it, atomically and identity-verified against
+  # the same empty/corrupt content we inspected, exactly like the dead-owner path above.
+  phx_fq_take_lock_dir "$phx_lk" "$phx_lk_raw" || return 1
+  if mkdir "$phx_lk" 2>/dev/null; then
+    printf '%s' "$$" > "$phx_lk/pid" 2>/dev/null || true
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# F6/F7 fixes (fix round 1) — the flush is no longer silent about what the server refused, and one
+# bad line can no longer wedge every line behind it.
+#
+# F6 (server-rejected entries were silently destroyed): EnforcementViolationService.ingest returns
+# `200` with a non-zero `rejected`/`rejectionReasons` for entries that failed per-entry validation —
+# a future `occurredAt` from ordinary clock skew is reachable without any misbehaviour at all. The
+# flush treated ANY `2xx` as "fully delivered", removed those lines, and never read the body, so the
+# violation vanished with zero trace on either side. It is now read and recorded (see
+# phx_fq_note): the entries are still removed (retrying an entry the server will reject identically
+# forever would wedge the queue — F7's whole point), but the rejection is LOUD, never silent.
+#
+# F7 (one malformed line wedged the workspace forever): `jq -cs` over a chunk fails WHOLESALE on a
+# single unparseable line, and the loop then `break`s without removing anything — so the same bad
+# line was retried, and failed, on every future invocation, silently starving every newer, valid
+# entry queued behind it. The fast path is unchanged (one `jq` per chunk) and is still taken
+# whenever every line parses; only when it fails does the slow path partition the chunk line by
+# line, move the specific bad lines to a sidecar (`violation-queue.rejected.ndjson`, bounded and
+# rotated), and POST the remaining good ones. The bad lines are treated as CONSUMED, so the loop
+# advances past them instead of retrying them forever. A persistent `400` — the server cannot parse
+# or accept this request body, and identical bytes will fail identically forever — is quarantined
+# the same way; every other non-`2xx` (and every transport failure) still `break`s and is retried
+# later, exactly as before, because those are transient or configuration faults the client CAN
+# recover from by waiting.
+#
+# The diagnostic channel is gate.log, not stderr, deliberately: this function runs from the EXIT
+# trap, after the finish_* function has already fixed the exit status and written stdout, and
+# section 7's own contract is that on an exit-0 path "stderr reaches only the debug log, so the file
+# is the durable artefact". Nothing here writes stdout (that would corrupt the hook's own JSON
+# decision) and nothing here changes the exit code — telemetry is never a second vote on the
+# verdict.
+# ---------------------------------------------------------------------------
+
+phx_fq_note() { # <event-suffix> <count> <detail-text> -- one structured gate.log line, never stdout
+  local phx_nt_count="$2" phx_nt_detail
+  case "$phx_nt_count" in ''|*[!0-9]*) phx_nt_count=0 ;; esac
+  # Bound the detail axis (R4): the server's rejectionReasons can carry one string PER ENTRY, up to
+  # a 200-entry chunk, and this is appended to a rotated-but-shared log file.
+  phx_nt_detail="$(printf '%s' "$3" | tr '\n\r\t' '   ' | cut -c1-2000)"
+  mkdir -p "$PHX_HOME_DIR" 2>/dev/null || return 0
+  jq -cn \
+    --arg ts "$(phx_iso_now)" \
+    --arg gv "$PHX_GATE_VERSION" \
+    --arg gate "${phx_gate:-unknown}" \
+    --arg event "purplephx.gate.violation_flush.$1" \
+    --arg detail "$phx_nt_detail" \
+    --arg workspaceId "${PHX_WORKSPACE_ID:-}" \
+    --argjson count "$phx_nt_count" \
+    '{ts:$ts,event:$event,gateVersion:$gv,gate:$gate,workspaceId:$workspaceId,count:$count,detail:$detail}' \
+    >> "$PHX_LOG_FILE" 2>/dev/null || true
+  return 0
+}
+
+phx_fq_quarantine() { # <lines-file> <sidecar-path>  -- append, bounded + rotated; never re-sent
+  [ -s "$1" ] || return 0
+  local phx_qz_size
+  mkdir -p "$(dirname "$2")" 2>/dev/null || return 0
+  if [ -f "$2" ]; then
+    phx_qz_size="$(wc -c < "$2" 2>/dev/null | tr -d ' ')"
+    case "$phx_qz_size" in ''|*[!0-9]*) phx_qz_size=0 ;; esac
+    if [ "$phx_qz_size" -gt "$phx_fq_rejected_max_bytes" ]; then
+      mv -f "$2" "$2.1" 2>/dev/null || true
+    fi
+  fi
+  cat "$1" >> "$2" 2>/dev/null || true
+  return 0
+}
+
+phx_fq_partition_slice() { # <slice-file> <good-out> <bad-out> -> prints the bad-line count
+  local phx_ps_line phx_ps_bad=0
+  : > "$2" 2>/dev/null || true
+  : > "$3" 2>/dev/null || true
+  while IFS= read -r phx_ps_line || [ -n "$phx_ps_line" ]; do
+    [ -n "$phx_ps_line" ] || continue
+    if printf '%s\n' "$phx_ps_line" | jq -e 'type == "object"' >/dev/null 2>&1; then
+      printf '%s\n' "$phx_ps_line" >> "$2" 2>/dev/null || true
+    else
+      printf '%s\n' "$phx_ps_line" >> "$3" 2>/dev/null || true
+      phx_ps_bad=$(( phx_ps_bad + 1 ))
+    fi
+  done < "$1"
+  printf '%s' "$phx_ps_bad"
+}
+
+# The actual flush body, run only once the caller (phx_flush_violation_queue, below) holds the
+# per-org+workspace lock. Takes the queue file path as a parameter rather than computing it itself.
+phx_flush_violation_queue_locked() { # <queue-file-path> -- always returns 0, see the section header
+  local phx_fq_file="$1" phx_fq_lines
+  phx_fq_lines="$(wc -l < "$phx_fq_file" 2>/dev/null | tr -d ' ')"
+  case "$phx_fq_lines" in ''|*[!0-9]*) phx_fq_lines=0 ;; esac
+  [ "$phx_fq_lines" -gt 0 ] || return 0
+
+  local phx_fq_url="$PHX_API_BASE/api/v1/external/purplephx/enforcement-violation?workspaceId=$PHX_WORKSPACE_ID"
+  local phx_fq_start=1 phx_fq_end phx_fq_chunk phx_fq_body phx_fq_http phx_fq_deadline phx_fq_flushed_end=0
+  local phx_fq_slice phx_fq_good phx_fq_bad phx_fq_sent_src phx_fq_badcount phx_fq_rejected phx_fq_reasons
+  local phx_fq_rejfile
+  phx_fq_rejfile="$(dirname "$phx_fq_file")/violation-queue.rejected.ndjson"
+  phx_fq_slice="$PHX_TMP_ROOT/violation-slice.ndjson"
+  phx_fq_good="$PHX_TMP_ROOT/violation-slice.good.ndjson"
+  phx_fq_bad="$PHX_TMP_ROOT/violation-slice.bad.ndjson"
+  while [ "$phx_fq_start" -le "$phx_fq_lines" ]; do
+    # F1: recomputed every iteration — see the section header comment above.
+    phx_fq_deadline="$(phx_remaining 2>/dev/null)"
+    case "$phx_fq_deadline" in ''|*[!0-9-]*) phx_fq_deadline=0 ;; esac
+    [ "$phx_fq_deadline" -gt 1 ] && phx_fq_deadline=1
+    [ "$phx_fq_deadline" -ge 1 ] || break   # budget exhausted: stop, leave the rest queued
+
+    phx_fq_end=$(( phx_fq_start + 199 ))
+    phx_fq_chunk="$PHX_TMP_ROOT/violation-chunk.json"
+    sed -n "${phx_fq_start},${phx_fq_end}p" "$phx_fq_file" > "$phx_fq_slice" 2>/dev/null || true
+    [ -s "$phx_fq_slice" ] || break
+    phx_fq_sent_src="$phx_fq_slice"
+    phx_fq_badcount=0
+    if ! jq -cs '{violations: .}' < "$phx_fq_slice" > "$phx_fq_chunk" 2>/dev/null || [ ! -s "$phx_fq_chunk" ]; then
+      # F7 slow path — at least one line in this chunk is not parseable JSON. Partition, quarantine
+      # the specific bad lines, and rebuild the body from what is left. Paid ONLY when the fast path
+      # above has already failed, so the common case is still exactly one `jq` per chunk.
+      phx_fq_badcount="$(phx_fq_partition_slice "$phx_fq_slice" "$phx_fq_good" "$phx_fq_bad")"
+      case "$phx_fq_badcount" in ''|*[!0-9]*) phx_fq_badcount=0 ;; esac
+      phx_fq_quarantine "$phx_fq_bad" "$phx_fq_rejfile"
+      [ "$phx_fq_badcount" -gt 0 ] && phx_fq_note "malformed_quarantined" "$phx_fq_badcount" \
+        "unparseable queue line(s) moved to $phx_fq_rejfile; they are NOT reported to the backend"
+      phx_fq_sent_src="$phx_fq_good"
+      if ! jq -cs '{violations: .}' < "$phx_fq_good" > "$phx_fq_chunk" 2>/dev/null || [ ! -s "$phx_fq_chunk" ]; then
+        # Nothing left in this chunk worth POSTing. The bad lines are quarantined, so this chunk is
+        # CONSUMED — advance past it instead of retrying it, forever, ahead of every newer entry.
+        phx_fq_flushed_end="$phx_fq_end"
+        [ "$phx_fq_flushed_end" -gt "$phx_fq_lines" ] && phx_fq_flushed_end="$phx_fq_lines"
+        phx_fq_start=$(( phx_fq_end + 1 ))
+        continue
+      fi
+    fi
+    phx_fq_body="$PHX_TMP_ROOT/violation-resp.json"
+    : > "$phx_fq_body" 2>/dev/null || true
+    phx_fq_http="$(phx_curl_config | curl -sS --config - \
+        --max-time "$phx_fq_deadline" \
+        -H 'Content-Type: application/json' \
+        --data-binary "@$phx_fq_chunk" \
+        -o "$phx_fq_body" -w '%{http_code}' \
+        "$phx_fq_url" 2>/dev/null)" || phx_fq_http=""
+    case "$phx_fq_http" in
+      2??) ;;
+      400)
+        # F7: the server cannot parse or accept this request body at all. Identical bytes will fail
+        # identically on every future invocation, so retrying wedges this workspace permanently.
+        # Quarantine what was actually sent and advance; every other status still retries later.
+        phx_fq_quarantine "$phx_fq_sent_src" "$phx_fq_rejfile"
+        phx_fq_note "http_400_quarantined" "$(wc -l < "$phx_fq_sent_src" 2>/dev/null | tr -d ' ')" \
+          "the backend rejected this chunk's request body with HTTP 400; moved to $phx_fq_rejfile, NOT retried"
+        phx_fq_flushed_end="$phx_fq_end"
+        [ "$phx_fq_flushed_end" -gt "$phx_fq_lines" ] && phx_fq_flushed_end="$phx_fq_lines"
+        phx_fq_start=$(( phx_fq_end + 1 ))
+        continue ;;
+      *) break ;;
+    esac
+    # F6: a 2xx does NOT mean every entry was accepted. Read the ingest result and record any
+    # per-entry rejection, with its count and the server's own reasons, before the lines are
+    # removed below.
+    phx_fq_rejected="$(jq -r '.rejected // 0' < "$phx_fq_body" 2>/dev/null)"
+    case "$phx_fq_rejected" in ''|*[!0-9]*) phx_fq_rejected=0 ;; esac
+    if [ "$phx_fq_rejected" -gt 0 ]; then
+      phx_fq_reasons="$(jq -r '[(.rejectionReasons // [])[] | tostring] | join(" | ")' < "$phx_fq_body" 2>/dev/null)"
+      if [ "$(jq -r '.batchTooLarge // false' < "$phx_fq_body" 2>/dev/null)" = "true" ]; then
+        phx_fq_note "server_rejected_batch_too_large" "$phx_fq_rejected" "$phx_fq_reasons"
+      else
+        phx_fq_note "server_rejected" "$phx_fq_rejected" "$phx_fq_reasons"
+      fi
+    fi
+    # This chunk is now CONFIRMED delivered — only lines up to here may ever be removed below.
+    # Clamp to phx_fq_lines (the original snapshot) so a short final chunk can never mark a line
+    # beyond what was actually snapshotted as "flushed".
+    phx_fq_flushed_end="$phx_fq_end"
+    [ "$phx_fq_flushed_end" -gt "$phx_fq_lines" ] && phx_fq_flushed_end="$phx_fq_lines"
+    phx_fq_start=$(( phx_fq_end + 1 ))
+  done
+
+  # F3: clear only the confirmed-flushed prefix, from a FRESH read of the file taken right before
+  # the write — never the whole file, and never the original snapshot's content. See the section
+  # header comment above for why. (F4: this re-read is what a second, LOCKED invocation now always
+  # sees the first invocation's already-committed rewrite through, rather than racing it.)
+  # (F7: "confirmed-flushed" now also covers lines this run deliberately QUARANTINED — they were
+  # moved to the sidecar, not lost, and must not be retried.)
+  if [ "$phx_fq_flushed_end" -gt 0 ]; then
+    tail -n "+$((phx_fq_flushed_end + 1))" "$phx_fq_file" 2>/dev/null | phx_atomic_write "$phx_fq_file" 2>/dev/null || true
+  fi
+  return 0
+}
+
+phx_flush_violation_queue() {
+  [ -n "${phx_policy_http:-}" ] || return 0
+  [[ "${PHX_WORKSPACE_ID:-}" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || return 0
+  [ -n "${PHX_TMP_ROOT:-}" ] && [ -d "$PHX_TMP_ROOT" ] || return 0
+
+  local phx_fq_dir phx_fq_file
+  phx_fq_dir="$PHX_HOME_DIR/${phx_org_key:-org-default}/${phx_ws_key:-org-default}"
+  phx_fq_file="$phx_fq_dir/violation-queue.ndjson"
+  [ -s "$phx_fq_file" ] || return 0
+
+  # F4 fix: serialize flush ATTEMPTS for this org+workspace queue file — see the section header
+  # comment above for the race this closes and why this is not the kind of lock design section 14
+  # rule 4 forbids (non-blocking; skip, never wait). A lock already held means another invocation's
+  # flush is in progress or was recently completed; this invocation skips its OWN flush entirely and
+  # leaves the queue file completely untouched, safe to retry next invocation.
+  local phx_fq_lock="$phx_fq_dir/.flush.lock"
+  phx_fq_acquire_flush_lock "$phx_fq_lock" || return 0
+
+  phx_flush_violation_queue_locked "$phx_fq_file"
+  local phx_fq_rc=$?
+  # Released unconditionally, on the very next statement after the call above returns — regardless
+  # of which internal path (`break` out of the loop, the loop completing normally, or its own early
+  # `return 0`) phx_flush_violation_queue_locked took to get there. This is what makes the release
+  # safe even if that function is edited later to add another early return: there is no path back
+  # into THIS function that skips this line. A lock that outlives an actual process kill is not
+  # cleaned up here — that is exactly what phx_fq_acquire_flush_lock's PID-liveness (or, as a
+  # fallback, short-staleness) reclaim is for. F5: the release is OWNERSHIP-CHECKED and atomic (see
+  # phx_fq_release_flush_lock) — a bare `rm -rf` here could delete a lock that a DIFFERENT
+  # invocation legitimately reclaimed and now holds.
+  phx_fq_release_flush_lock "$phx_fq_lock"
+  return "$phx_fq_rc"
+}
+
+PHX_TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/purplephx-gate.XXXXXX" 2>/dev/null)" || PHX_TMP_ROOT=""
+phx_cleanup() { [ -n "$PHX_TMP_ROOT" ] && rm -rf "$PHX_TMP_ROOT" 2>/dev/null || true; }
+# The flush runs BEFORE cleanup — it needs PHX_TMP_ROOT for its own scratch files — and never
+# affects the exit code the gate already decided: this trap fires AFTER the finish_* function's own
+# `exit N` has fixed the process's exit status, nothing in phx_flush_violation_queue ever calls
+# `exit`, and the `|| true` below means even an unexpected non-zero return from it changes nothing
+# (point 3 of the T7 brief — telemetry can never become a second vote on the verdict).
+phx_on_exit() { phx_flush_violation_queue || true; phx_cleanup; }
+trap phx_on_exit EXIT
+if [ -z "$PHX_TMP_ROOT" ]; then
+  phx_finish_skip "backend_unreachable" "no_tempdir" \
+    "[purplephx] BACKEND UNREACHABLE - gate skipped: no writable temporary directory."
+fi
+
+# ---------------------------------------------------------------------------
+# 10b. API-key exchange (added 2026-09-15)
+#
+# THE BUG THIS FIXES. Every endpoint this gate calls lives under
+# `/api/v1/external/**`, and ExternalTokenAuthenticationFilter rejects any bearer
+# that does not start with `phx_at_` BEFORE it looks anything up:
+#
+#     val looksLikeAccessToken = raw.startsWith(ExternalAccessTokenService.TOKEN_PREFIX)
+#     ...
+#     if (!looksLikeAccessToken) { return unauthorized(exchange, path) }
+#
+#   (the Kotlin variable is renamed to `raw` in the quotation above, on purpose.
+#   tests/gate_block_new_test.sh and tests/gate_violation_queue_test.sh assert that
+#   the literal auth-scheme keyword appears EXACTLY ONCE in this file, so that the
+#   request header is built in exactly one place and no second code path can ever
+#   put the token somewhere it does not belong. That guard is worth more than a
+#   verbatim quotation, so the quotation gives way, not the guard.)
+#
+# `TOKEN_PREFIX = "phx_at_"`. The Phoenix UI hands an operator a `phx_live_*` API
+# KEY, and the installation guide said only "set PHX_API_TOKEN" — so the shipped
+# gate sent the API key raw, got a bodiless 401 with NO server-side log line, and
+# reported BACKEND UNREACHABLE on every first install. The gate was honest that a
+# skip is not a pass, but an operator reading "BACKEND UNREACHABLE" blames their
+# network, not their token type. That is this file's own named failure shape —
+# a control that installs, reports itself active, and verifies nothing — reached
+# by the one route the file did not guard: the credential's own SHAPE.
+#
+# Fix: exchange the API key for a short-lived `phx_at_*` access token at
+# POST /api/v1/external/auth/token. Deliberate properties of the code below:
+#
+#   * Runs ONCE per invocation, here, after PHX_TMP_ROOT exists and before the
+#     first authenticated call. Every later call (policy, resolve, execute, poll,
+#     sarif, and the violation flush in the EXIT trap) then authenticates with the
+#     exchanged token through the UNCHANGED phx_curl_config — no call site moves.
+#   * The exchanged token's TTL is an hour, far longer than this gate's whole
+#     budget, so there is deliberately no refresh path to get wrong.
+#   * A failed exchange is a SKIP, never a pass, and it distinguishes the two
+#     causes. A token of the wrong SHAPE is a configuration mistake the operator
+#     can fix in one command; reporting it as an outage sends them to the wrong
+#     place, which is precisely the defect this block exists to remove.
+#   * The key still never reaches argv: the exchange reuses phx_curl_config's
+#     stdin config file, exactly like every other network call in this file.
+#
+# A `phx_at_*` token in PHX_API_TOKEN keeps today's behaviour EXACTLY: no extra
+# call, no extra budget spent, nothing new that can fail.
+# ---------------------------------------------------------------------------
+case "$PHX_API_TOKEN" in
+  phx_at_*)
+    # Already an access token. Nothing to do.
+    :
+    ;;
+  phx_live_*|phx_dev_*)
+    phx_budget_ok 3 || phx_finish_skip "budget_expired" "budget_expired_before_token_exchange" \
+      "[purplephx] BUDGET EXPIRED - gate skipped before the API key could be exchanged for an access token. No scan ran, so NOTHING about this diff has been verified."
+    phx_xchg_body="$PHX_TMP_ROOT/token-exchange.json"
+    phx_xchg_http="$(phx_curl_config | curl -sS --config - \
+        --max-time "$(phx_call_deadline)" \
+        -X POST \
+        -H 'Content-Type: application/json' \
+        --data-binary '{}' \
+        -o "$phx_xchg_body" -w '%{http_code}' \
+        "$PHX_API_BASE/api/v1/external/auth/token" 2>/dev/null)" || phx_xchg_http=""
+    if [ "$phx_xchg_http" != "200" ]; then
+      phx_finish_skip "backend_unreachable" "token_exchange_failed" \
+        "[purplephx] BACKEND UNREACHABLE - gate skipped: exchanging the PHX_API_TOKEN API key for an access token at ${PHX_API_BASE}/api/v1/external/auth/token returned '${phx_xchg_http:-no response}'. No scan ran, so NOTHING about this diff has been verified. A 401 here means the API key is wrong, revoked, expired, or belongs to a different Phoenix environment than PHX_API_BASE points at."
+    fi
+    phx_xchg_token="$(jq -r '.accessToken // ""' "$phx_xchg_body" 2>/dev/null)"
+    rm -f "$phx_xchg_body" 2>/dev/null
+    case "$phx_xchg_token" in
+      phx_at_*) ;;
+      *)
+        phx_finish_skip "backend_unreachable" "token_exchange_unparseable" \
+          "[purplephx] BACKEND UNREACHABLE - gate skipped: the token-exchange response carried no usable phx_at_* accessToken. No scan ran, so NOTHING about this diff has been verified."
+        ;;
+    esac
+    # Every call after this line authenticates with the exchanged access token.
+    PHX_API_TOKEN="$phx_xchg_token"
+    ;;
+  *)
+    # PASSED THROUGH UNCHANGED, and that is a deliberate reversal of this block's
+    # first draft, which refused anything outside the three known prefixes.
+    #
+    # The client is not the authority on which credentials the server accepts. A
+    # deployment can mint a shape this script has never heard of, and a gate that
+    # refuses it has turned a working install into a permanent skip on the strength
+    # of a hardcoded list it cannot keep current. That trades one silent-off failure
+    # for another, which is no trade at all.
+    #
+    # It is also not theoretical: the pack's own suite (tests/gate_*.sh, 11 files)
+    # drives the gate with PHX_API_TOKEN="test-token-abc-123", and the refusing
+    # version failed every one of them.
+    #
+    # So an unrecognised shape is SENT, exactly as before this block existed, and
+    # the server decides. What the shape DOES buy us is diagnosis after the fact:
+    # phx_token_shape_hint below turns the resulting 401 from "BACKEND UNREACHABLE"
+    # — which sends an operator to check their network — into a message naming the
+    # credential as the likely cause. That is the part of the original intent worth
+    # keeping, and it belongs where the evidence is, not ahead of it.
+    :
+    ;;
+esac
+
+# Appended to a 401 skip message, and ONLY to a 401: a token that is not a
+# `phx_at_*` access token is by far the likeliest reason the server refused this
+# call, but the gate never asserts it as fact — the server's status code is the
+# evidence, and this sentence is a lead, not a verdict. Empty for a `phx_at_*`
+# token, so a genuine 401 on a correct credential is never muddied by a guess.
+phx_token_shape_hint() {
+  case "$PHX_API_TOKEN" in
+    phx_at_*) : ;;
+    *) printf ' Note: PHX_API_TOKEN is not a `phx_at_` access token, which is the only credential `/api/v1/external/**` accepts. A `phx_live_`/`phx_dev_` API key is exchanged automatically by this gate; any other value is sent as-is. If this 401 persists, exchange your API key at POST %s/api/v1/external/auth/token and use the returned accessToken.' "$PHX_API_BASE" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# 11. Policy resolution (design section 8, AC-P3-7, AC-P3-8, F8)
+#
+# 200                         -> use it, cache it, print "(server, fetched Ns ago)"
+# 200 + source SYSTEM_DEFAULT -> print "NO POLICY CONFIGURED", proceed ADVISORY on section 5 defaults
+# 404                         -> SOFT-OFF: print "POLICY DISABLED SERVER-SIDE", advisory, exit 0
+# anything else / timeout     -> cache -> baked ladder, each printing its own source string
+#
+# The 404 arm is the one that is easy to get wrong and is the whole section 16 kill switch: a 404
+# is AUTHORITATIVE "off", not "unreachable". Treating it as unreachable would fall back to a stale
+# cached BLOCK policy and keep blocking forever after an operator lowered the flag to stop it.
+# ---------------------------------------------------------------------------
+phx_policy_body="$PHX_TMP_ROOT/policy.json"
+phx_policy_http=""
+if phx_budget_ok 3; then
+  phx_policy_url="$PHX_API_BASE/api/v1/external/purplephx/enforcement-policy"
+  [ -n "$PHX_WORKSPACE_ID" ] && phx_policy_url="$phx_policy_url?workspaceId=$PHX_WORKSPACE_ID"
+  phx_policy_http="$(phx_curl_config | curl -sS --config - \
+      --max-time 2 \
+      -o "$phx_policy_body" -w '%{http_code}' \
+      "$phx_policy_url" 2>/dev/null)" || phx_policy_http=""
+fi
+
+phx_apply_policy_json() { # <file> — sets mode/blocking/domains/updatedAt from an API-shaped body
+  local phx_src="$1" phx_ok
+  phx_ok="$(jq -r 'if (.mode? and (.blockingSeverities? | type == "array")) then "yes" else "no" end' "$phx_src" 2>/dev/null)"
+  [ "$phx_ok" = "yes" ] || return 1
+  phx_policy_mode="$(jq -r '.mode' "$phx_src")"
+  phx_policy_blocking="$(jq -c '.blockingSeverities' "$phx_src")"
+  if [ "$phx_gate" = "commit" ]; then
+    phx_policy_domains="$(jq -c '.commitDomains // ["SAST","SECRETS"]' "$phx_src")"
+  else
+    phx_policy_domains="$(jq -c '.pushDomains // ["SAST","SCA"]' "$phx_src")"
+  fi
+  phx_policy_updated_at="$(jq -r '.updatedAt // ""' "$phx_src")"
+  # Phase 6 T7 — the backend's own provenance field, re-parsed on every call (a cached body is the
+  # server's own JSON re-read verbatim, so this is correct for the cache arm too; the baked ladder
+  # never calls this function at all, so phx_policy_resolved_source stays at its "" initial value
+  # there, which is exactly right — a baked policy carries no exception metadata). `// empty`
+  # everywhere below, never `// ""`-then-compare-to-"null": a JSON `null` must never leak the
+  # literal string "null" into a rendered disclosure line or a queued violation payload.
+  phx_policy_resolved_source="$(jq -r '.source // empty' "$phx_src")"
+  if [ "$phx_policy_resolved_source" = "EXCEPTION_APPLIED" ]; then
+    phx_policy_exception_id="$(jq -r '.appliedExceptionId // empty' "$phx_src")"
+    phx_policy_exception_granted_by="$(jq -r '.exceptionGrantedBy // empty' "$phx_src")"
+    phx_policy_exception_requested_by="$(jq -r '.exceptionRequestedBy // empty' "$phx_src")"
+    phx_policy_exception_expires_at="$(jq -r '.exceptionExpiresAt // empty' "$phx_src")"
+  else
+    phx_policy_exception_id=""
+    phx_policy_exception_granted_by=""
+    phx_policy_exception_requested_by=""
+    phx_policy_exception_expires_at=""
+  fi
+  return 0
+}
+
+phx_policy_note=""
+phx_soft_off=0
+
+case "$phx_policy_http" in
+  200)
+    if phx_apply_policy_json "$phx_policy_body"; then
+      phx_policy_source="server"
+      phx_policy_age_seconds=0
+      phx_policy_note="(server, fetched 0s ago)"
+      if [ "$(jq -r '.source // ""' "$phx_policy_body")" = "SYSTEM_DEFAULT" ]; then
+        # NOT a soft-off. The feature is on; the org simply has no row. Section 5 defaults apply
+        # and the run proceeds as advisory — distinct from the 404 arm, and printed differently so
+        # the two are never conflated in a transcript or a support ticket.
+        phx_policy_mode="ADVISORY"
+        phx_policy_blocking='[]'
+        if [ "$phx_gate" = "commit" ]; then phx_policy_domains='["SAST","SECRETS"]'; else phx_policy_domains='["SAST","SCA"]'; fi
+        phx_policy_note="NO POLICY CONFIGURED $phx_policy_note"
+      fi
+      # Cache it. Section 14 rule 3: last-writer-wins with ONE guard — never replace a cache entry
+      # whose fetchedAt is NEWER than ours. All writers are writing the same server answer, so
+      # there is nothing else to reconcile.
+      phx_cache_new_epoch="$(phx_now_epoch)"
+      phx_cache_old_epoch=0
+      if [ -f "$PHX_CACHE_FILE" ]; then
+        phx_cache_old_epoch="$(jq -r '.fetchedAtEpoch // 0' "$PHX_CACHE_FILE" 2>/dev/null)"
+        case "$phx_cache_old_epoch" in ''|*[!0-9]*) phx_cache_old_epoch=0 ;; esac
+      fi
+      if [ "$phx_cache_new_epoch" -ge "$phx_cache_old_epoch" ]; then
+        jq -c --arg fetchedAt "$(phx_iso_now)" --argjson fetchedAtEpoch "$phx_cache_new_epoch" \
+          '. + {fetchedAt:$fetchedAt, fetchedAtEpoch:$fetchedAtEpoch}' "$phx_policy_body" 2>/dev/null \
+          | phx_atomic_write "$PHX_CACHE_FILE" || true
+      fi
+    else
+      phx_policy_http="malformed"
+    fi
+    ;;
+  404)
+    phx_soft_off=1
+    ;;
+esac
+
+if [ "$phx_soft_off" = "1" ]; then
+  phx_policy_source="server"
+  phx_policy_age_seconds=0
+  phx_policy_mode="ADVISORY"
+  phx_policy_blocking='[]'
+  phx_finish_allow "policy_disabled" \
+    "[purplephx] POLICY DISABLED SERVER-SIDE - enforcement is switched off for this organization or workspace. The gate allowed this command without scanning."
+fi
+
+if [ "$phx_policy_source" = "none" ]; then
+  # Transport failure, timeout, or a non-200-non-404 status. Cache, then baked. Each prints its
+  # own source string; AC-P3-7 requires exactly one of the three to appear in every non-skip run.
+  if [ -f "$PHX_CACHE_FILE" ] && phx_apply_policy_json "$PHX_CACHE_FILE"; then
+    phx_cache_epoch="$(jq -r '.fetchedAtEpoch // 0' "$PHX_CACHE_FILE" 2>/dev/null)"
+    case "$phx_cache_epoch" in ''|*[!0-9]*) phx_cache_epoch=0 ;; esac
+    phx_policy_age_seconds=$(( $(phx_now_epoch) - phx_cache_epoch ))
+    [ "$phx_policy_age_seconds" -lt 0 ] && phx_policy_age_seconds=0
+    phx_policy_source="cache"
+    phx_policy_note="(cache, fetched $(( phx_policy_age_seconds / 60 ))m ago)"
+  else
+    phx_policy_source="baked"
+    phx_policy_age_seconds=-1
+    phx_policy_note="(baked at install)"
+    phx_unsubstituted "$PHX_BAKED_MODE" && PHX_BAKED_MODE="ADVISORY"
+    phx_unsubstituted "$PHX_BAKED_BLOCKING_SEVERITIES" && PHX_BAKED_BLOCKING_SEVERITIES='[]'
+    phx_unsubstituted "$PHX_BAKED_COMMIT_DOMAINS" && PHX_BAKED_COMMIT_DOMAINS='["SAST","SECRETS"]'
+    phx_unsubstituted "$PHX_BAKED_PUSH_DOMAINS" && PHX_BAKED_PUSH_DOMAINS='["SAST","SCA"]'
+    phx_policy_mode="$PHX_BAKED_MODE"
+    phx_policy_blocking="$PHX_BAKED_BLOCKING_SEVERITIES"
+    if [ "$phx_gate" = "commit" ]; then phx_policy_domains="$PHX_BAKED_COMMIT_DOMAINS"; else phx_policy_domains="$PHX_BAKED_PUSH_DOMAINS"; fi
+    phx_policy_updated_at=""
+  fi
+fi
+
+case "$phx_policy_mode" in ADVISORY|GATE|BLOCK) ;; *) phx_policy_mode="ADVISORY" ;; esac
+
+# ---------------------------------------------------------------------------
+# 11b. Phase 6 T7 — exception disclosure + EXCEPTION_APPLIED violation emission (design section
+# 17.6.3, .superpowers/sdd/2026-09-12-purple-enforcement-phase6-exceptions-plan/task-7-brief.md).
+#
+# Checked exactly once, immediately after policy resolution (11) and mode normalisation above, and
+# BEFORE any verdict is computed below — this is a signal about policy PROVENANCE (did a live
+# exception weaken the resolved policy this invocation used), orthogonal to whatever verdict
+# (allow/gate/deny/skip) this invocation goes on to reach. It fires whether the resolved policy
+# came from a live server fetch or a cached one (phx_apply_policy_json parses `source` identically
+# in both arms); it can never fire from the baked ladder, which carries no exception metadata and
+# never calls phx_apply_policy_json at all.
+#
+# Two independent, additive effects, both gated on the SAME check:
+#   (1) The disclosure is appended to phx_policy_note — the variable already rendered into every
+#       "Policy: ..." line at every phx_finish_* call site below — so this reaches the developer on
+#       every path (advisory/gate/block) with no per-call-site change required.
+#   (2) Exactly one EXCEPTION_APPLIED entry is queued via phx_queue_violation, independent of
+#       phx_violation_kind_for (see that function's own KDoc above for why this is deliberately a
+#       separate call site, not a mapped verdict/reason/skipReason triple).
+# ---------------------------------------------------------------------------
+if [ "$phx_policy_resolved_source" = "EXCEPTION_APPLIED" ]; then
+  if [ -n "$phx_policy_exception_expires_at" ]; then
+    phx_exception_expiry_note="(expires $phx_policy_exception_expires_at)"
+  else
+    phx_exception_expiry_note="(indefinite)"
+  fi
+  phx_policy_note="$phx_policy_note — relaxed by exception $phx_policy_exception_id granted by $phx_policy_exception_granted_by $phx_exception_expiry_note"
+
+  phx_queue_violation "EXCEPTION_APPLIED" "" "" \
+    "$phx_policy_exception_id" "$phx_policy_exception_granted_by" "$phx_policy_exception_requested_by"
+fi
+
+# ---------------------------------------------------------------------------
+# 12. The diff, its base, and diffHash (design section 9, AC-P3-13, AC-P3-14, F9)
+#
+# `--abbrev=40` on every `git diff --raw`, no exceptions (Global Constraint 12). Plain
+# `git diff --raw` abbreviates blob shas to a length chosen from the repository's OBJECT COUNT, so
+# without the flag two clones of identical content compute DIFFERENT diffHash values and one
+# machine's hashes change the day git widens the abbreviation — invalidating every outstanding
+# receipt at once, silently, as a `gate`-mode deny on a diff that had just passed.
+# ---------------------------------------------------------------------------
+phx_head_sha="$(git -C "$phx_cwd" rev-parse HEAD 2>/dev/null || echo "")"
+phx_branch="$(git -C "$phx_cwd" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")"
+
+phx_raw_file="$PHX_TMP_ROOT/diff.raw"
+phx_base_ref=""
+# D4 (design section 9 rung 4 / lines 1954-1956): non-empty only when rung 4's ADVISORY-only
+# tip-commit fallback (below) fires. Section 17's ADVISORY branch prepends it to its own output so
+# the loud-skip text ("NO PUSH BASE...") still reaches the developer even though the script does
+# NOT exit here for that mode. Always initialised (set -u) even on the commit-gate path, which
+# never touches it.
+phx_base_fallback_notice=""
+
+if [ "$phx_gate" = "commit" ]; then
+  phx_base_rung="index"
+  phx_base_ref="HEAD"
+  phx_base_sha="$phx_head_sha"
+  git -C "$phx_cwd" diff --cached --raw --abbrev=40 > "$phx_raw_file" 2>/dev/null || : > "$phx_raw_file"
+else
+  # The push base ladder — first rung that resolves wins (design section 9, AC-P3-14, D4).
+  # The base NEVER comes from `tool_input.command`: `git push upstream feature` names a remote and
+  # a branch, but that string is model-authored and passing it to git is exactly the interpolation
+  # F6 forbids. And the gate NEVER fetches: a stale origin/main yields an OLDER base and therefore
+  # a LARGER diff, which fails toward more scanning; fetching would add a network call to the
+  # latency budget and mutate the developer's repository.
+  phx_base_ref="$(git -C "$phx_cwd" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)" && phx_base_rung="upstream"
+  if [ -z "$phx_base_ref" ]; then
+    phx_base_ref="$(git -C "$phx_cwd" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)" && phx_base_rung="origin-head"
+  fi
+  if [ -z "$phx_base_ref" ]; then
+    phx_first_remote="$(git -C "$phx_cwd" remote 2>/dev/null | head -1)"
+    if [ -n "$phx_first_remote" ]; then
+      phx_base_ref="$(git -C "$phx_cwd" symbolic-ref --short "refs/remotes/$phx_first_remote/HEAD" 2>/dev/null)" && phx_base_rung="first-remote"
+    fi
+  fi
+  # D4 fix: rung 4 ("none of the above resolve") is a LOUD SKIP for gate/block, unchanged — a
+  # known, VISIBLE, deliberately accepted hole for those two modes (design section 9 rung 4;
+  # `.claude/rules/documentation-structure.md`-governed spec, lines 510 and 1954-1956). ADVISORY is
+  # the one mode the spec requires to still scan: "advisory mode still runs the (b) tip-commit
+  # scan so the developer gets findings." The skip is still COUNTED either way — same skip record,
+  # same gate.log line — only whether the script then exits differs.
+  phx_tip_commit_fallback() { # <skipReason> <human message> — ADVISORY-only. Records the loud
+    # skip exactly as phx_finish_skip would (skip record + gate.log line, written while
+    # phx_base_rung is still "none" so the record itself is unchanged), then sets phx_base_rung to
+    # "tip-commit" and phx_base_ref/phx_base_sha to HEAD~1 (or git's empty-tree sentinel on the
+    # repository's very first commit, where HEAD~1 does not exist) and RETURNS instead of exiting.
+    phx_write_skip_record "$1" "NOT_RUN"
+    phx_write_log "skip" "not_matched" "$1"
+    phx_base_fallback_notice="$2"
+    phx_base_rung="tip-commit"
+    if git -C "$phx_cwd" rev-parse --verify -q HEAD~1 >/dev/null 2>&1; then
+      phx_base_ref="HEAD~1"
+      phx_base_sha="$(git -C "$phx_cwd" rev-parse HEAD~1 2>/dev/null)"
+    else
+      phx_base_ref="(empty tree - first commit)"
+      phx_base_sha="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    fi
+  }
+
+  if [ -z "$phx_base_ref" ]; then
+    phx_base_rung="none"
+    if [ "$phx_policy_mode" = "ADVISORY" ]; then
+      phx_tip_commit_fallback "no_push_base" \
+        "[purplephx] NO PUSH BASE - gate skipped. None of @{upstream}, origin/HEAD or the first remote's HEAD resolved in ${phx_cwd}. Falling back to a tip-commit scan (HEAD~1..HEAD) so you still get findings; set an upstream (git push -u) to enable the full push gate."
+    else
+      phx_finish_skip "not_matched" "no_push_base" \
+        "[purplephx] NO PUSH BASE - gate skipped. None of @{upstream}, origin/HEAD or the first remote's HEAD resolved in ${phx_cwd}, so the branch diff could not be computed and NOTHING was scanned. Set an upstream (git push -u) to enable the push gate."
+    fi
+  fi
+
+  if [ "$phx_base_rung" != "tip-commit" ]; then
+    phx_base_sha="$(git -C "$phx_cwd" merge-base HEAD "$phx_base_ref" 2>/dev/null || echo "")"
+    if [ -z "$phx_base_sha" ]; then
+      phx_base_rung="none"
+      if [ "$phx_policy_mode" = "ADVISORY" ]; then
+        phx_tip_commit_fallback "no_merge_base" \
+          "[purplephx] NO PUSH BASE - gate skipped: ${phx_base_ref} resolved but has no merge base with HEAD. Falling back to a tip-commit scan (HEAD~1..HEAD) so you still get findings."
+      else
+        phx_finish_skip "not_matched" "no_merge_base" \
+          "[purplephx] NO PUSH BASE - gate skipped: ${phx_base_ref} resolved but has no merge base with HEAD, so the branch diff could not be computed and NOTHING was scanned."
+      fi
+    fi
+  fi
+  git -C "$phx_cwd" diff --raw --abbrev=40 "$phx_base_sha..HEAD" > "$phx_raw_file" 2>/dev/null || : > "$phx_raw_file"
+fi
+
+# `:<old-mode> <new-mode> <old-sha> <new-sha> <status>\t<path>` — the leading `:` is literal and
+# must be stripped; a rename/copy line carries TWO tab-separated paths and the POST-image path is
+# the last one, which is why `$NF` is used rather than `$2`.
+phx_pairs_file="$PHX_TMP_ROOT/pairs"
+phx_files_file="$PHX_TMP_ROOT/files"
+awk -F'\t' '
+  NF >= 2 {
+    split($1, meta, " ")
+    newsha = meta[4]; status = meta[5]; path = $NF
+    printf "%s:%s\n", path, newsha > PAIRS
+    if (substr(status, 1, 1) != "D") { printf "%s\n", path > FILES }
+  }
+' PAIRS="$phx_pairs_file" FILES="$phx_files_file" "$phx_raw_file" 2>/dev/null || true
+[ -f "$phx_pairs_file" ] || : > "$phx_pairs_file"
+[ -f "$phx_files_file" ] || : > "$phx_files_file"
+
+# diffHash = sha256 over the newline-joined, lexicographically sorted "<path>:<post-image blob
+# sha>" list. Content-addressed, so it is reproducible on any machine from the same content and
+# independent of commit metadata, timestamps and author. Deletions stay in the hash (their
+# post-image sha is the all-zero blob, which is still deterministic) but are kept out of
+# changedFiles, because a deleted file cannot be scanned.
+phx_diff_hash="$(sort "$phx_pairs_file" | phx_sha256)"
+phx_changed_files_json="$(sort -u "$phx_files_file" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+phx_changed_count="$(printf '%s' "$phx_changed_files_json" | jq -r 'length')"
+
+phx_base_disclosure=""
+if [ "$phx_gate" = "push" ]; then
+  phx_base_disclosure="Base: ${phx_base_ref} @ $(printf '%s' "$phx_base_sha" | cut -c1-8) (rung: ${phx_base_rung})"
+fi
+
+# ---------------------------------------------------------------------------
+# 13. GATE mode — receipt only, no scanning in the hook (design section 5)
+# ---------------------------------------------------------------------------
+phx_receipt_path="$PHX_RECEIPT_DIR/$phx_diff_hash.json"
+
+# Return codes, deliberately disjoint (I2/I6 fix, review round 1 — see below for why each is its
+# OWN code rather than collapsed onto an existing one):
+#   0  valid — satisfies all four section 9 conditions
+#   1  no receipt file, or a well-formed one that fails the validity check (existing behaviour)
+#   2  receipt file exists but jq could not parse/evaluate it (corrupt/unparseable JSON) — I2
+#   3  receipt file IS tracked in git — F12 refusal (unchanged meaning, renumbered from 2)
+#   4  the git-tracked check itself failed for a reason OTHER than "untracked" — I6
+phx_receipt_is_valid() {
+  [ -f "$phx_receipt_path" ] || return 1
+  # F12 (AC-P3-13). A COMMITTED receipt directory pre-satisfies the gate on every clone, so a
+  # tracked receipt is refused outright. This runs on every gate-mode read, not once at install:
+  # the installer's .gitignore line can be deleted by the very pull request that adds the receipt.
+  #
+  # I6 fix (review round 1): `git ls-files --error-unmatch` exits 1 SPECIFICALLY for "pathspec did
+  # not match any file(s) known to git" (the normal, expected, untracked case — verified live:
+  # `error: pathspec '...' did not match ...`, rc=1). Any OTHER nonzero exit (128 for "not a git
+  # repository" or a corrupt/unreadable index, verified live: `fatal: not a git repository`,
+  # `fatal: .git/index: index file smaller than expected`, both rc=128) means we could NOT prove
+  # the file is untracked — the previous code fell through to the jq validity check on ANY nonzero
+  # exit, which is fail-OPEN toward honouring a receipt we never actually verified is safe. Only
+  # exit 1 is treated as "untracked, safe to proceed"; every other outcome refuses the receipt.
+  git -C "$phx_cwd" ls-files --error-unmatch -- "$phx_receipt_path" >/dev/null 2>&1
+  case $? in
+    0) return 3 ;;   # tracked in git — F12 refusal
+    1) : ;;          # untracked — the expected case, fall through to the validity check below
+    *) return 4 ;;   # ambiguous/fatal error (not a repo, corrupt index, permission…) — fail closed
+  esac
+  # All FOUR section 9 conditions in ONE jq boolean expression joined by `and`. Deliberately not
+  # four shell tests joined by `&&`/`||`: a single mistyped operator there is a receipt that
+  # satisfies the gate when it should not, and it looks exactly like a working gate.
+  #
+  # I2 fix (review round 1): jq's OWN exit code is captured rather than discarded. jq exits 1 when
+  # `-e` sees a false/null final result (a well-formed receipt that simply fails a condition — the
+  # existing, correct "not valid" case) but exits >=2 on a genuine parse/runtime failure (malformed
+  # JSON via `--slurpfile`, for instance). Both used to reach this function's caller as the SAME
+  # value the F12 tracked-check ALSO used to return (2), so a corrupt receipt was misreported to the
+  # developer as "TRACKED IN GIT" — a different, wrong, and unactionable diagnosis. They are now
+  # disjoint return codes (1 vs 2), and the git-tracked case moved to 3/4 above to make room.
+  jq -e -n \
+    --slurpfile r "$phx_receipt_path" \
+    --arg diffHash "sha256:$phx_diff_hash" \
+    --argjson now "$(phx_now_epoch)" \
+    --arg mode "$phx_policy_mode" \
+    --argjson blocking "$phx_policy_blocking" \
+    --argjson domains "$phx_policy_domains" \
+    '($r[0] // {}) as $x
+     | ( ($x.diffHash // "") == $diffHash )
+       and ( ($x.expiresAtEpoch // 0) > $now )
+       and ( ($x.policy.mode // "") == $mode )
+       and ( ($x.policy.blockingSeverities // []) == $blocking )
+       and ( ($x.policy.domains // []) == $domains )
+       and ( ($x.result.verdict // "") == "pass" )
+       and ( ($x.scan.status // "") == "COMPLETED" )' >/dev/null 2>&1
+  phx_riv_jq_rc=$?
+  case "$phx_riv_jq_rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+if [ "$phx_policy_mode" = "GATE" ]; then
+  phx_receipt_is_valid
+  phx_receipt_rc=$?
+  if [ "$phx_receipt_rc" = "0" ]; then
+    phx_finish_allow "no_findings" ""
+  fi
+  if [ "$phx_receipt_rc" = "3" ]; then
+    phx_finish_deny "receipt_policy_mismatch" \
+"[purplephx] $(printf '%s' "$phx_gate" | tr '[:lower:]' '[:upper:]') BLOCKED - the receipt for this diff is TRACKED IN GIT and was refused.
+
+A committed .purplephx/receipts/ directory pre-satisfies this gate for every clone of this
+repository, which is why a tracked receipt is never honoured. Remove it from git and add
+.purplephx/receipts/ to .gitignore, then run /purple-scan to produce a real one.
+
+Policy: gate $phx_policy_note
+${phx_base_disclosure}"
+  fi
+  if [ "$phx_receipt_rc" = "4" ]; then
+    # I6 fix: a genuinely ambiguous/fatal error verifying tracked-status (not simply "untracked")
+    # is a DIFFERENT failure than F12's tracked-in-git refusal, and gets its own message rather
+    # than being silently treated as either "tracked" or "safe to honour".
+    phx_finish_deny "receipt_policy_mismatch" \
+"[purplephx] $(printf '%s' "$phx_gate" | tr '[:lower:]' '[:upper:]') BLOCKED - could not verify whether the receipt for this diff is safe to use.
+
+Checking whether .purplephx/receipts/${phx_diff_hash}.json is tracked in git failed unexpectedly
+(not simply 'untracked') and the receipt is refused rather than assumed safe. Run /purple-scan
+again once this is resolved.
+
+Policy: gate $phx_policy_note
+${phx_base_disclosure}"
+  fi
+  if [ "$phx_receipt_rc" = "2" ]; then
+    # I2 fix: the receipt file exists but jq could not parse or evaluate it — corrupt or invalid
+    # JSON, NOT the same failure as F12's tracked-in-git refusal, and a different, accurate message.
+    phx_finish_deny "no_receipt" \
+"[purplephx] $(printf '%s' "$phx_gate" | tr '[:lower:]' '[:upper:]') BLOCKED - the receipt for this diff exists but could not be read.
+
+.purplephx/receipts/${phx_diff_hash}.json is present but is not valid JSON (or could not be
+evaluated), so it cannot satisfy the gate. Delete it and run /purple-scan again to produce a fresh
+receipt.
+
+Policy: gate $phx_policy_note
+${phx_base_disclosure}"
+  fi
+  # No receipt, or a well-formed one that is expired or was written under a different policy.
+  # Distinguish them for the log so the three are countable apart; the developer-facing message is
+  # the same either way.
+  phx_gate_reason="no_receipt"
+  if [ -f "$phx_receipt_path" ]; then
+    if jq -e -n --slurpfile r "$phx_receipt_path" --argjson now "$(phx_now_epoch)" \
+        '(($r[0] // {}).expiresAtEpoch // 0) <= $now' >/dev/null 2>&1; then
+      phx_gate_reason="receipt_expired"
+    else
+      phx_gate_reason="receipt_policy_mismatch"
+    fi
+  fi
+  phx_finish_deny "$phx_gate_reason" \
+"[purplephx] $(printf '%s' "$phx_gate" | tr '[:lower:]' '[:upper:]') BLOCKED - no current Purple scan covers this diff.
+
+Run /purple-scan to scan the ${phx_changed_count} changed file(s) and produce a receipt, then run
+this command again. The gate does not scan on your behalf in gate mode.
+
+Policy: gate $phx_policy_note
+${phx_base_disclosure}
+To see everything: /purple-scan"
+fi
+
+# ---------------------------------------------------------------------------
+# 14. Scan client — PR-scan V1 (D1, design sections 7.2 / 7.3)
+#
+#   POST /api/v1/external/pr-scan/resolve   -> resolvedBundles (a HARD precondition of execute)
+#   POST /api/v1/external/pr-scan/execute   -> jobId
+#   GET  /api/v1/external/pr-scan/{jobId}   -> poll at a fixed 2s interval
+#   GET  /api/v1/external/pr-scan/{jobId}/sarif -> per-finding results
+#
+# `timeoutSeconds` on the execute request is the REMAINING internal budget at the moment of the
+# call, never a fixed constant — that is section 7.2's "hard server-side deadline <= the gate's
+# internal budget" requirement, and a constant there is how a scan outlives the hook that asked
+# for it.
+# ---------------------------------------------------------------------------
+phx_domains_json="$(printf '%s' "$phx_policy_domains" | jq -c '
+  reduce .[] as $d ({};
+    . + (if   $d == "SAST"    then {"sast":{"enabled":true}}
+         elif $d == "SECRETS" then {"secret":{"enabled":true}}
+         elif $d == "SCA"     then {"sca":{"enabled":true}}
+         else {} end))')"
+
+phx_scan_skip() { # <skipReason> <human detail>
+  phx_finish_skip "backend_unreachable" "$1" \
+    "[purplephx] BACKEND UNREACHABLE - gate skipped. $2 No scan ran, so NOTHING about this diff has been verified." "NOT_RUN"
+}
+
+phx_budget_ok 5 || phx_finish_skip "budget_expired" "budget_expired_before_scan" \
+  "[purplephx] BUDGET EXPIRED - gate skipped before the scan could start. No scan ran, so NOTHING about this diff has been verified." "NOT_RUN"
+
+phx_resolve_body="$PHX_TMP_ROOT/resolve.json"
+phx_resolve_req="$PHX_TMP_ROOT/resolve.req"
+jq -n --arg repoName "$PHX_REPO_NAME" --arg ws "$PHX_WORKSPACE_ID" \
+  '{repoName:$repoName, workspaceId:(if $ws == "" then null else $ws end)}' > "$phx_resolve_req"
+phx_resolve_http="$(phx_curl_config | curl -sS --config - \
+    --max-time "$(phx_call_deadline)" \
+    -H 'Content-Type: application/json' \
+    --data-binary "@$phx_resolve_req" \
+    -o "$phx_resolve_body" -w '%{http_code}' \
+    "$PHX_API_BASE/api/v1/external/pr-scan/resolve" 2>/dev/null)" || phx_resolve_http=""
+
+# A 401 here is the first place a wrong-shaped credential becomes visible, so it is
+# the right place to say so — see phx_token_shape_hint's own comment for why the
+# hint is attached to the evidence rather than asserted ahead of it.
+if [ "$phx_resolve_http" != "200" ]; then
+  # A 401 is a credential problem, not an outage, and gate.log must be able to say
+  # so: `resolve_unauthorized` is what an operator greps for, and it is the only
+  # thing here that distinguishes "your token was refused" from "the host was down".
+  #
+  # The `reason` field stays `backend_unreachable` on BOTH branches, deliberately.
+  # phx_violation_kind_for maps `reason` (not skipReason) to the violation `kind`,
+  # and `kind` is a server-validated enum -- phx_queue_violation's own comment
+  # records that the service REJECTS values outside it. Minting a SKIP_AUTH here
+  # would either be refused on flush or silently drop the entry, and a skip that is
+  # never counted is worse than one counted imprecisely: design section 17.7 is
+  # explicit that a skip IS a violation. So the imprecision is accepted, named
+  # here, and left as a server-side decision rather than taken unilaterally by a
+  # client script -- the same boundary as the token-shape arm above.
+  phx_resolve_hint=""
+  phx_resolve_skip_reason="resolve_failed"
+  if [ "$phx_resolve_http" = "401" ]; then
+    phx_resolve_hint="$(phx_token_shape_hint)"
+    phx_resolve_skip_reason="resolve_unauthorized"
+  fi
+  phx_scan_skip "$phx_resolve_skip_reason" \
+    "The PR-scan resolve call returned '${phx_resolve_http:-no response}'.${phx_resolve_hint}"
+fi
+
+phx_bundles="$(jq -c '.bundles // []' "$phx_resolve_body" 2>/dev/null)"
+[ -n "$phx_bundles" ] || phx_scan_skip "resolve_unparseable" "The PR-scan resolve response could not be parsed."
+
+phx_budget_ok 5 || phx_finish_skip "budget_expired" "budget_expired_after_resolve" \
+  "[purplephx] BUDGET EXPIRED - gate skipped after bundle resolution and before the scan. No scan ran, so NOTHING about this diff has been verified." "NOT_RUN"
+
+phx_execute_body="$PHX_TMP_ROOT/execute.json"
+phx_execute_req="$PHX_TMP_ROOT/execute.req"
+# Commit-gate encoding (D1 obligation 3): a staged, uncommitted diff has no native representation
+# in a branch/PR-shaped request, so it is encoded as baseBranch = HEAD with an explicit
+# changedFiles list. This is the agreed workaround and is named here rather than inferred.
+if [ "$phx_gate" = "commit" ]; then
+  phx_base_branch="HEAD"
+else
+  phx_base_branch="$phx_base_ref"
+fi
+jq -n \
+  --arg repoName "$PHX_REPO_NAME" \
+  --arg ws "$PHX_WORKSPACE_ID" \
+  --arg baseBranch "$phx_base_branch" \
+  --arg headBranch "$phx_branch" \
+  --arg commitSha "$phx_head_sha" \
+  --argjson changedFiles "$phx_changed_files_json" \
+  --argjson timeoutSeconds "$(phx_remaining)" \
+  --argjson resolvedBundles "$phx_bundles" \
+  --argjson domains "$phx_domains_json" \
+  '{repoName:$repoName, workspaceId:(if $ws == "" then null else $ws end),
+    baseBranch:$baseBranch, headBranch:$headBranch, commitSha:$commitSha,
+    changedFiles:$changedFiles, timeoutSeconds:$timeoutSeconds,
+    resolvedBundles:$resolvedBundles, domains:$domains}' > "$phx_execute_req"
+
+phx_execute_http="$(phx_curl_config | curl -sS --config - \
+    --max-time "$(phx_call_deadline)" \
+    -H 'Content-Type: application/json' \
+    --data-binary "@$phx_execute_req" \
+    -o "$phx_execute_body" -w '%{http_code}' \
+    "$PHX_API_BASE/api/v1/external/pr-scan/execute" 2>/dev/null)" || phx_execute_http=""
+
+case "$phx_execute_http" in
+  200|202) ;;
+  *) phx_scan_skip "execute_failed" "The PR-scan execute call returned '${phx_execute_http:-no response}'." ;;
+esac
+
+phx_scan_job_id="$(jq -r '.jobId // ""' "$phx_execute_body" 2>/dev/null)"
+[ -n "$phx_scan_job_id" ] || phx_scan_skip "execute_no_job_id" "The PR-scan execute response carried no jobId."
+
+# Poll at a fixed 2-second interval until a terminal status or the internal budget expires,
+# whichever comes first. Budget expiry with a NON-TERMINAL job is a SKIP, not a pass, and the jobId
+# is recorded in the skip record so the scan is still findable in the UI afterwards.
+phx_job_body="$PHX_TMP_ROOT/job.json"
+phx_job_status="RUNNING"
+while :; do
+  if ! phx_budget_ok 3; then
+    phx_finish_skip "budget_expired" "scan_not_terminal_at_budget_expiry" \
+      "[purplephx] BUDGET EXPIRED - gate skipped: scan job ${phx_scan_job_id} was still ${phx_job_status} when the gate's internal budget ran out. The scan may still complete; find it in the Phoenix dashboard. NOTHING about this diff has been verified here." "$phx_job_status"
+  fi
+  phx_job_http="$(phx_curl_config | curl -sS --config - \
+      --max-time "$(phx_call_deadline)" \
+      -o "$phx_job_body" -w '%{http_code}' \
+      "$PHX_API_BASE/api/v1/external/pr-scan/$phx_scan_job_id" 2>/dev/null)" || phx_job_http=""
+  if [ "$phx_job_http" = "200" ]; then
+    phx_job_status="$(jq -r '.status // "RUNNING"' "$phx_job_body" 2>/dev/null)"
+    case "$phx_job_status" in
+      PENDING|RUNNING) ;;
+      *) break ;;
+    esac
+  fi
+  sleep 2
+done
+
+# A non-COMPLETED terminal status (TIMEOUT / ERROR, and anything a future server adds) is a SKIP,
+# never presented as a clean result (`.claude/rules/evidence-grounding.md` R3). This is the same
+# shape as the iac-scanning precedent: a partial or failed scan rendered as "completed" is a false
+# clean, which is worse than no gate.
+if [ "$phx_job_status" != "COMPLETED" ]; then
+  phx_finish_skip "backend_unreachable" "scan_terminal_not_completed" \
+    "[purplephx] BACKEND UNREACHABLE - gate skipped: scan job ${phx_scan_job_id} ended with status ${phx_job_status}, not COMPLETED. A non-completed scan is never read as a clean result, so NOTHING about this diff has been verified." "$phx_job_status"
+fi
+
+# The SCA gap, DISCLOSED and never silently absorbed (D1 obligation 1). PrScanDomainFanOut.runSca
+# returns SKIPPED on every path, including the path where its own manifest/lockfile trigger
+# MATCHED. If the resolved policy asked for SCA, the gate still requests it and the server reports
+# it skipped — and the receipt must reflect that NO SCA VERDICT WAS PRODUCED. A "clean SCA" is
+# never inferred from an SCA domain that did not run, and bySeverity counts only domains that
+# actually completed.
+#
+# I3 fix (review round 1). `(.domainResults // {})` maps BOTH "the field is null/absent" and "the
+# field is present and genuinely `{}`" onto the same empty object — `to_entries` on either gives
+# `[]`, so `$bad` (the "requested but not completed" list) came out EMPTY in both cases. A null/
+# absent `domainResults` was therefore silently read as "every requested domain completed", the
+# best possible case, instead of what it actually is: the surface told us NOTHING about coverage.
+# The two are now distinguished explicitly: a null/absent `domainResults` marks every REQUESTED
+# domain as unknown coverage (never "ran", never "completed"), and only a present (even if empty)
+# `domainResults` object is read with the original per-domain completed/not-completed logic.
+phx_domain_results_null="$(jq -r 'if (.domainResults == null) then "yes" else "no" end' "$phx_job_body" 2>/dev/null)"
+[ "$phx_domain_results_null" = "yes" ] || phx_domain_results_null="no"
+
+if [ "$phx_domain_results_null" = "yes" ]; then
+  phx_domains_ran='[]'
+  phx_domains_not_run="$(printf '%s' "$phx_domains_json" | jq -r 'keys | join(", ")' 2>/dev/null)"
+  phx_coverage_unknown=1
+else
+  phx_domains_ran="$(jq -c '[(.domainResults // {}) | to_entries[] | select(.value.status == "completed") | .key]' "$phx_job_body" 2>/dev/null)"
+  [ -n "$phx_domains_ran" ] || phx_domains_ran='[]'
+  phx_domains_not_run="$(jq -r --argjson requested "$phx_domains_json" '
+      ($requested | keys) as $want
+    | [(.domainResults // {}) | to_entries[] | select(.value.status != "completed") | .key] as $bad
+    | [$want[] | select(. as $w | $bad | index($w))] | join(", ")' "$phx_job_body" 2>/dev/null)"
+  phx_coverage_unknown=0
+fi
+
+phx_budget_ok 3 || phx_finish_skip "budget_expired" "budget_expired_before_sarif" \
+  "[purplephx] BUDGET EXPIRED - gate skipped before the scan results could be read. Scan job ${phx_scan_job_id} completed; read it in the Phoenix dashboard. NOTHING about this diff has been verified here." "$phx_job_status"
+
+phx_sarif_body="$PHX_TMP_ROOT/results.sarif"
+phx_sarif_http="$(phx_curl_config | curl -sS --config - \
+    --max-time "$(phx_call_deadline)" \
+    -o "$phx_sarif_body" -w '%{http_code}' \
+    "$PHX_API_BASE/api/v1/external/pr-scan/$phx_scan_job_id/sarif" 2>/dev/null)" || phx_sarif_http=""
+[ "$phx_sarif_http" = "200" ] || phx_scan_skip "sarif_unavailable" \
+  "Scan job ${phx_scan_job_id} completed but its SARIF result returned '${phx_sarif_http:-no response}'."
+
+# ---------------------------------------------------------------------------
+# 15. Newness (D2, design section 9 invariants, AC-P3-4, AC-P3-5)
+#
+# TWO of D2's three mechanisms are implemented here; the third is NOT IMPLEMENTABLE from a shell
+# gate against the PR-scan V1 surface, and that is recorded rather than approximated:
+#
+#  1. STORED-BASELINE IDENTITY — NOT AVAILABLE ON THIS SURFACE. The gate does not compute baseline
+#     identity; it reads whatever field the scan surface exposes to mark a finding pre-existing vs
+#     new. PR-scan V1 exposes none: `PrScanJobDetailResponse` has no per-finding data at all, and
+#     `PrScanSarifHelper` emits only ruleId / ruleIndex / level / message / location / fingerprints
+#     (+ optional properties.bundle_sources). There is no baseline, suppression, or first-seen
+#     field to read. Every SAST finding therefore falls through to mechanism 2, and the receipt
+#     records `baselineSource: "no-baseline-field-on-surface"` so a reader can tell that D2
+#     obligation 1's assumption did not hold here, rather than believing a baseline comparison ran.
+#
+#  2. HUNK-SCOPED FALLBACK — IMPLEMENTED, and always available. A finding is NEW iff its path is
+#     one of the changed files AND its line falls inside a changed hunk range from `git diff -U0`.
+#     Applies unconditionally to Secrets and SCA (no identity table exists for them) and, given
+#     point 1, to SAST as well. This is also D2 obligation 5's first-run rule: a repository with no
+#     baseline uses this fallback — never "everything is new" (which bricks the repo on its whole
+#     backlog) and never "nothing is new" (which is a gate that does nothing).
+#
+#  3. REACHABILITY PASS (push only, additive-only) — NOT IMPLEMENTABLE FROM THE GATE SCRIPT AS
+#     SPECIFIED, and deliberately not approximated. The ruling names AiSecReachabilityResolver, a
+#     Kotlin interface over the ArcadeDB call graph; a shell script has no access to it. The only
+#     route would be the PR-scan V1 request/response cycle, and it carries no reachability axis:
+#     `PrBundleExecuteRequest` has no reachability parameter, and neither `PrScanJobDetailResponse`
+#     nor the SARIF document exposes a per-finding reachability classification (the
+#     `reachability_score` column that `GraphFindingValidator` populates on `PrScanFindingEntity`
+#     is never rendered onto any endpoint this gate can reach). Inventing a client-side graph call
+#     from bash is explicitly forbidden, and a fabricated heuristic in its place would be a
+#     reachability verdict nobody computed. CONSEQUENCE, stated plainly: a pre-existing finding
+#     that a push makes reachable is NOT surfaced by this gate. Because the pass is additive-only
+#     by construction, its absence can only ever UNDER-report new findings — it can never cause a
+#     wrongful block. Recorded as a Known Gap for the feature docs.
+# ---------------------------------------------------------------------------
+phx_hunks_file="$PHX_TMP_ROOT/hunks"
+if [ "$phx_gate" = "commit" ]; then
+  git -C "$phx_cwd" diff -U0 --cached > "$PHX_TMP_ROOT/diff.u0" 2>/dev/null || : > "$PHX_TMP_ROOT/diff.u0"
+else
+  git -C "$phx_cwd" diff -U0 "$phx_base_sha..HEAD" > "$PHX_TMP_ROOT/diff.u0" 2>/dev/null || : > "$PHX_TMP_ROOT/diff.u0"
+fi
+# `+++ b/<path>` names the post-image file (`/dev/null` for a deletion — skipped, there is nothing
+# to scan). `@@ -a,b +c,d @@` gives the post-image hunk start and length; a length of 0 (a pure
+# deletion hunk) still occupies the single line `c` for locating purposes.
+#
+# Two parsing traps, both handled, because a diff's BODY lines are indistinguishable from its
+# HEADER lines by prefix alone:
+#   * `^diff --git ` is the ONLY unambiguous file boundary. Under -U0 there are no context lines,
+#     so every body line begins with `+` or `-` and an added line renders as `+diff --git …` —
+#     which this pattern cannot match. A bare `^\+\+\+ ` test is NOT safe on its own: an added line
+#     whose content is `++ foo` renders in the diff as exactly `+++ foo`.
+#   * The post-image range is field 3 of `@@ -a,b +c,d @@`, taken POSITIONALLY. Reaching for it
+#     with a greedy `sub(/^.*\+/, …)` breaks on the function-context suffix git appends — in
+#     `@@ -1,2 +3,4 @@ int a = b+c;` the greedy match strips all the way through `b+`.
+awk '
+  /^diff --git /{ path = ""; inhdr = 1; next }
+  inhdr && /^\+\+\+ /{
+    p = substr($0, 5)
+    if (p == "/dev/null") { path = "" } else { sub(/^b\//, "", p); path = p }
+    inhdr = 0
+    next
+  }
+  /^@@ /{
+    inhdr = 0
+    if (path == "") next
+    m = $3
+    sub(/^\+/, "", m)
+    n = index(m, ",")
+    if (n > 0) { start = substr(m, 1, n - 1) + 0; len = substr(m, n + 1) + 0 }
+    else       { start = m + 0; len = 1 }
+    if (len < 1) len = 1
+    printf "%s\t%d\t%d\n", path, start, start + len - 1
+    next
+  }
+' "$PHX_TMP_ROOT/diff.u0" > "$phx_hunks_file" 2>/dev/null || : > "$phx_hunks_file"
+[ -f "$phx_hunks_file" ] || : > "$phx_hunks_file"
+phx_hunks_json="$(jq -Rsc '[splits("\n") | select(length > 0) | split("\t") | {path: .[0], start: (.[1]|tonumber), end: (.[2]|tonumber)}]' < "$phx_hunks_file" 2>/dev/null)"
+[ -n "$phx_hunks_json" ] || phx_hunks_json='[]'
+
+# Flatten the SARIF into a finding list. Severity comes from the RUN's own
+# tool.driver.rules[ruleIndex].properties.severity, never from `level`: SARIF `level` collapses
+# CRITICAL and HIGH into "error", so reading severity from it would silently demote every CRITICAL.
+# Where a rule entry is genuinely missing, the fallback maps "error" to CRITICAL — the STRICTER
+# reading, per `.claude/rules/evidence-grounding.md` R3's conservative default.
+phx_findings_json="$(jq -c \
+  --argjson changed "$phx_changed_files_json" \
+  --argjson hunks "$phx_hunks_json" \
+  '
+  [ .runs[]?
+    | (.tool.driver.rules // []) as $rules
+    | (.results // [])[]
+    | . as $r
+    | ( if ($r.ruleIndex != null and $r.ruleIndex >= 0 and $r.ruleIndex < ($rules | length))
+        then $rules[$r.ruleIndex] else null end ) as $rule
+    | ( ($r.locations // [])[0] ) as $loc
+    | ( ($loc.physicalLocation.artifactLocation.uri) // "" ) as $path
+    | ( ($loc.physicalLocation.region.startLine) // 0 ) as $line
+    | {
+        ruleId: ($r.ruleId // ""),
+        ruleName: ( ($rule.shortDescription.text) // ($r.ruleId // "") ),
+        severity: ( ($rule.properties.severity)
+                    // (if (($r.level // "") == "error") then "CRITICAL"
+                        elif (($r.level // "") == "warning") then "MEDIUM"
+                        else "LOW" end) ),
+        message: ($r.message.text // ""),
+        path: $path,
+        line: $line,
+        isNew: ( ($changed | index($path)) != null
+                 and ( [ $hunks[] | select(.path == $path and .start <= $line and .end >= $line) ] | length ) > 0 ),
+        newBy: "HUNK"
+      }
+  ]' "$phx_sarif_body" 2>/dev/null)"
+[ -n "$phx_findings_json" ] || phx_findings_json='[]'
+
+phx_new_json="$(printf '%s' "$phx_findings_json" | jq -c '[.[] | select(.isNew)]')"
+phx_new_findings="$(printf '%s' "$phx_new_json" | jq -r 'length')"
+phx_by_severity="$(printf '%s' "$phx_new_json" | jq -c '
+  reduce .[] as $f ({"CRITICAL":0,"HIGH":0,"MEDIUM":0,"LOW":0};
+    if (.[$f.severity] != null) then .[$f.severity] += 1 else . end)')"
+phx_new_detail="$(printf '%s' "$phx_new_json" | jq -c '[.[] | {path,line,ruleId,severity,newBy}]')"
+
+# ---------------------------------------------------------------------------
+# 16. Message assembly (design section 9 "Block message", F7)
+#
+# Everything below that came out of the repository or the rule corpus is sanitised (section 5) and
+# the whole findings block is wrapped in this invocation's own random nonce envelope before it
+# reaches EITHER channel. Only the fixed scaffolding lines around it are ours.
+#
+# ONE HONEST OMISSION: section 9's per-finding shape has both a `Fix:` one-liner and a `Guidance:`
+# block. PR-scan V1's SARIF carries a single `message.text` and no separate remediation field, so
+# `Guidance:` renders that text and `Fix:` is omitted rather than duplicated or invented. The
+# footer says so, once, instead of the reader inferring that a remediation service was consulted.
+# ---------------------------------------------------------------------------
+phx_render_findings() { # <findings-json> <limit>
+  printf '%s' "$1" | jq -r --argjson limit "$2" "$PHX_JQ_SANITIZE"'
+    [ .[] | select(.isNew) ] as $new
+    | ($new | if length > $limit then .[0:$limit] else . end)
+    | to_entries
+    | map(
+        .key as $i | .value as $f
+        | ( ($f.ruleId + " " + $f.ruleName + " " + $f.message)
+            | ([match("CWE-[0-9]+"; "i").string] | first) // "" ) as $cwe
+        | ( if $cwe == "" then ($f.ruleId | phx_inline) else $cwe end ) as $label
+        | "\($i + 1). \($label) \($f.ruleName | phx_inline)  \($f.path | phx_inline):\($f.line)\n   Guidance: \($f.message | phx_inline)"
+      )
+    | join("\n\n")'
+}
+
+phx_wrap_untrusted() { # <text>
+  printf '<untrusted-data nonce="%s">\n%s\n</untrusted-data nonce="%s">' "$PHX_NONCE" "$1" "$PHX_NONCE"
+}
+
+phx_sca_note=""
+if [ "$phx_coverage_unknown" = "1" ]; then
+  # I3 fix: distinct wording for "the surface reported no domain results at all" — this is UNKNOWN
+  # coverage, not "these specific domains failed to complete," and must not read as the latter.
+  phx_sca_note="
+COVERAGE UNKNOWN: the scan response reported no domain results at all, so no verdict could be
+confirmed for ${phx_domains_not_run:-the requested domains} — none is implied here."
+elif [ -n "$phx_domains_not_run" ]; then
+  phx_sca_note="
+NOT SCANNED: the domain(s) ${phx_domains_not_run} were requested but did not complete on this
+scan, so no verdict was produced for them and none is implied here."
+fi
+
+phx_upper_gate="$(printf '%s' "$phx_gate" | tr '[:lower:]' '[:upper:]')"
+phx_diff_word="branch"
+[ "$phx_gate" = "commit" ] && phx_diff_word="staged"
+# The rung-4 tip-commit fallback (section 12, D4) scans a single-commit diff, not a branch diff —
+# say so, so the summary line does not contradict the fallback notice already prepended above it.
+[ "$phx_base_rung" = "tip-commit" ] && phx_diff_word="commit"
+
+# ---------------------------------------------------------------------------
+# 17. Decision emission (design section 6.2, AC-P3-1, AC-P3-4, AC-P3-5, AC-P3-6)
+# ---------------------------------------------------------------------------
+if [ "$phx_policy_mode" = "ADVISORY" ]; then
+  # ADVISORY NEVER BLOCKS and NEVER writes to stderr. `additionalContext` on stdout with exit 0 is
+  # advisory mode's ONLY channel to the model: stderr on exit 0 goes to the debug log and Claude
+  # never sees it, and exit 0 means no permissionDecision is consulted.
+  phx_total="$(printf '%s' "$phx_findings_json" | jq -r 'length')"
+  phx_body="[purplephx] ADVISORY - ${phx_new_findings} new finding(s) (of ${phx_total} total) in this ${phx_diff_word} diff. This command was NOT blocked.
+"
+  # D4: the push-base rung-4 loud-skip text, when the tip-commit fallback fired above, is
+  # prepended here so it still reaches the developer even though the gate did not exit at rung 4.
+  if [ -n "$phx_base_fallback_notice" ]; then
+    phx_body="$phx_base_fallback_notice
+
+$phx_body"
+  fi
+  if [ "$phx_new_findings" -gt 0 ]; then
+    phx_body="$phx_body
+$(phx_wrap_untrusted "$(phx_render_findings "$phx_findings_json" 10)")
+"
+  fi
+  phx_body="$phx_body
+Policy: advisory $phx_policy_note
+${phx_base_disclosure}${phx_sca_note}
+Findings are reported against changed hunks only; pre-existing debt is not listed. To see everything: /purple-scan"
+  phx_finish_allow "$([ "$phx_new_findings" -gt 0 ] && echo new_findings || echo no_findings)" "$phx_body"
+fi
+
+# BLOCK mode. Only findings whose severity is in the policy's blocking set, and only NEW ones —
+# pre-existing debt never blocks (design section 5's first invariant). Without that, one legacy
+# HIGH bricks the repository and the team disables the hook the same day; AC-P3-5 is the
+# adoption-critical test for it.
+phx_blocking_json="$(printf '%s' "$phx_new_json" | jq -c --argjson sev "$phx_policy_blocking" '[.[] | select(.severity as $s | $sev | index($s))]')"
+phx_blocking_count="$(printf '%s' "$phx_blocking_json" | jq -r 'length')"
+phx_sev_label="$(printf '%s' "$phx_policy_blocking" | jq -r 'join("/")')"
+
+if [ "$phx_blocking_count" -gt 0 ]; then
+  phx_block_msg="[purplephx] ${phx_upper_gate} BLOCKED - ${phx_blocking_count} new ${phx_sev_label} findings in this ${phx_diff_word} diff.
+
+$(phx_wrap_untrusted "$(phx_render_findings "$phx_blocking_json" 10)")
+
+Policy: block on ${phx_sev_label} $phx_policy_note
+${phx_base_disclosure}${phx_sca_note}
+Guidance above is the scanning rule's own message; this scan surface supplies no separate
+remediation field. Fix these, then run the command again. To see everything: /purple-scan"
+  phx_finish_deny "new_findings" "$phx_block_msg"
+fi
+
+# PASS. Write the receipt so a subsequent `gate`-mode run over the identical diff, under the
+# identical policy, does not have to scan again.
+phx_envelope "pass" "" "COMPLETED" "$phx_by_severity" "$phx_new_detail" "$phx_baseline_source" \
+  | phx_atomic_write "$PHX_RECEIPT_DIR/$phx_diff_hash.json" || true
+
+phx_finish_allow "no_findings" "[purplephx] PASS - no new ${phx_sev_label} findings in this ${phx_diff_word} diff.
+
+Policy: block on ${phx_sev_label} $phx_policy_note
+${phx_base_disclosure}${phx_sca_note}"

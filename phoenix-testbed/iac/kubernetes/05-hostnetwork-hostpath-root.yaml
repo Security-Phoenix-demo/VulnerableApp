@@ -1,0 +1,64 @@
+# INTENTIONALLY VULNERABLE — Phoenix correlation test fixture. NOT deployable manifest.
+# All credentials are FAKE/SYNTHETIC.
+#
+# TARGET: PHX-IAC-COMB-005 "Root container + hostNetwork + hostPath /"
+#   = rulePattern PHX-IAC-SINK-HOST-NETWORK + propertyMatch `hostPath=/`
+#
+# EXPECTED PARTIAL: as with COMB-001, the `hostPath=/` component is EXPECTED TO FAIL TO MATCH —
+# it reads a top-level `hostPath` property, but in a real manifest hostPath is nested under
+# spec.template.spec.volumes[].hostPath.path. The PHX-IAC-SINK-HOST-NETWORK sink SHOULD still fire:
+# usesHostNetwork() explicitly looks at spec.template.spec.hostNetwork (and spec.hostNetwork), so
+# that predicate — unlike the rule's propertyMatch — is nesting-aware.
+#
+# This asymmetry is worth keeping in the test bed precisely because it is confusing: the SINK
+# predicate handles nesting, the RULE's propertyMatch does not, and the two disagree about the same
+# manifest.
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: phx-testbed-node-agent-secret
+  namespace: kube-system
+type: Opaque
+stringData:
+  # FAKE — no entropy. Taint origin.
+  node_agent_token: "phx-testbed-fake-node-token-0123456789"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: phx-testbed-node-agent
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: phx-testbed-node-agent
+  template:
+    metadata:
+      labels:
+        app: phx-testbed-node-agent
+    spec:
+      # usesHostNetwork() reads exactly this path — nesting-aware, unlike the rule's propertyMatch.
+      hostNetwork: true
+      hostPID: true
+      hostIPC: true
+      containers:
+        - name: agent
+          image: alpine:3.18
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          envFrom:
+            - secretRef:
+                name: phx-testbed-node-agent-secret
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+              readOnly: false
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
