@@ -1973,9 +1973,26 @@ phx_resolve_http="$(phx_curl_config | curl -sS --config - \
 # the right place to say so — see phx_token_shape_hint's own comment for why the
 # hint is attached to the evidence rather than asserted ahead of it.
 if [ "$phx_resolve_http" != "200" ]; then
+  # A 401 is a credential problem, not an outage, and gate.log must be able to say
+  # so: `resolve_unauthorized` is what an operator greps for, and it is the only
+  # thing here that distinguishes "your token was refused" from "the host was down".
+  #
+  # The `reason` field stays `backend_unreachable` on BOTH branches, deliberately.
+  # phx_violation_kind_for maps `reason` (not skipReason) to the violation `kind`,
+  # and `kind` is a server-validated enum -- phx_queue_violation's own comment
+  # records that the service REJECTS values outside it. Minting a SKIP_AUTH here
+  # would either be refused on flush or silently drop the entry, and a skip that is
+  # never counted is worse than one counted imprecisely: design section 17.7 is
+  # explicit that a skip IS a violation. So the imprecision is accepted, named
+  # here, and left as a server-side decision rather than taken unilaterally by a
+  # client script -- the same boundary as the token-shape arm above.
   phx_resolve_hint=""
-  [ "$phx_resolve_http" = "401" ] && phx_resolve_hint="$(phx_token_shape_hint)"
-  phx_scan_skip "resolve_failed" \
+  phx_resolve_skip_reason="resolve_failed"
+  if [ "$phx_resolve_http" = "401" ]; then
+    phx_resolve_hint="$(phx_token_shape_hint)"
+    phx_resolve_skip_reason="resolve_unauthorized"
+  fi
+  phx_scan_skip "$phx_resolve_skip_reason" \
     "The PR-scan resolve call returned '${phx_resolve_http:-no response}'.${phx_resolve_hint}"
 fi
 
