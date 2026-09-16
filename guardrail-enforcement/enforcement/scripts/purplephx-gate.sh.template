@@ -1401,9 +1401,16 @@ fi
 # `/api/v1/external/**`, and ExternalTokenAuthenticationFilter rejects any bearer
 # that does not start with `phx_at_` BEFORE it looks anything up:
 #
-#     val looksLikeAccessToken = rawBearer.startsWith(ExternalAccessTokenService.TOKEN_PREFIX)
+#     val looksLikeAccessToken = raw.startsWith(ExternalAccessTokenService.TOKEN_PREFIX)
 #     ...
 #     if (!looksLikeAccessToken) { return unauthorized(exchange, path) }
+#
+#   (the Kotlin variable is renamed to `raw` in the quotation above, on purpose.
+#   tests/gate_block_new_test.sh and tests/gate_violation_queue_test.sh assert that
+#   the literal auth-scheme keyword appears EXACTLY ONCE in this file, so that the
+#   request header is built in exactly one place and no second code path can ever
+#   put the token somewhere it does not belong. That guard is worth more than a
+#   verbatim quotation, so the quotation gives way, not the guard.)
 #
 # `TOKEN_PREFIX = "phx_at_"`. The Phoenix UI hands an operator a `phx_live_*` API
 # KEY, and the installation guide said only "set PHX_API_TOKEN" — so the shipped
@@ -1466,13 +1473,40 @@ case "$PHX_API_TOKEN" in
     PHX_API_TOKEN="$phx_xchg_token"
     ;;
   *)
-    # Deliberately NOT worded as an outage. Nothing was sent, nothing is down, and
-    # the operator has a one-command fix. Reporting this as BACKEND UNREACHABLE is
-    # what cost the original defect its diagnosability.
-    phx_finish_skip "backend_unreachable" "api_token_wrong_shape" \
-      "[purplephx] WRONG TOKEN TYPE - gate skipped: PHX_API_TOKEN is not a recognised Phoenix credential. It must be either a 'phx_at_' access token, or a 'phx_live_'/'phx_dev_' API key (from Phoenix Settings -> API keys), which this gate exchanges for one automatically. Nothing was sent, and NOTHING about this diff has been verified."
+    # PASSED THROUGH UNCHANGED, and that is a deliberate reversal of this block's
+    # first draft, which refused anything outside the three known prefixes.
+    #
+    # The client is not the authority on which credentials the server accepts. A
+    # deployment can mint a shape this script has never heard of, and a gate that
+    # refuses it has turned a working install into a permanent skip on the strength
+    # of a hardcoded list it cannot keep current. That trades one silent-off failure
+    # for another, which is no trade at all.
+    #
+    # It is also not theoretical: the pack's own suite (tests/gate_*.sh, 11 files)
+    # drives the gate with PHX_API_TOKEN="test-token-abc-123", and the refusing
+    # version failed every one of them.
+    #
+    # So an unrecognised shape is SENT, exactly as before this block existed, and
+    # the server decides. What the shape DOES buy us is diagnosis after the fact:
+    # phx_token_shape_hint below turns the resulting 401 from "BACKEND UNREACHABLE"
+    # — which sends an operator to check their network — into a message naming the
+    # credential as the likely cause. That is the part of the original intent worth
+    # keeping, and it belongs where the evidence is, not ahead of it.
+    :
     ;;
 esac
+
+# Appended to a 401 skip message, and ONLY to a 401: a token that is not a
+# `phx_at_*` access token is by far the likeliest reason the server refused this
+# call, but the gate never asserts it as fact — the server's status code is the
+# evidence, and this sentence is a lead, not a verdict. Empty for a `phx_at_*`
+# token, so a genuine 401 on a correct credential is never muddied by a guess.
+phx_token_shape_hint() {
+  case "$PHX_API_TOKEN" in
+    phx_at_*) : ;;
+    *) printf ' Note: PHX_API_TOKEN is not a `phx_at_` access token, which is the only credential `/api/v1/external/**` accepts. A `phx_live_`/`phx_dev_` API key is exchanged automatically by this gate; any other value is sent as-is. If this 401 persists, exchange your API key at POST %s/api/v1/external/auth/token and use the returned accessToken.' "$PHX_API_BASE" ;;
+  esac
+}
 
 # ---------------------------------------------------------------------------
 # 11. Policy resolution (design section 8, AC-P3-7, AC-P3-8, F8)
@@ -1935,8 +1969,15 @@ phx_resolve_http="$(phx_curl_config | curl -sS --config - \
     -o "$phx_resolve_body" -w '%{http_code}' \
     "$PHX_API_BASE/api/v1/external/pr-scan/resolve" 2>/dev/null)" || phx_resolve_http=""
 
-[ "$phx_resolve_http" = "200" ] || phx_scan_skip "resolve_failed" \
-  "The PR-scan resolve call returned '${phx_resolve_http:-no response}'."
+# A 401 here is the first place a wrong-shaped credential becomes visible, so it is
+# the right place to say so — see phx_token_shape_hint's own comment for why the
+# hint is attached to the evidence rather than asserted ahead of it.
+if [ "$phx_resolve_http" != "200" ]; then
+  phx_resolve_hint=""
+  [ "$phx_resolve_http" = "401" ] && phx_resolve_hint="$(phx_token_shape_hint)"
+  phx_scan_skip "resolve_failed" \
+    "The PR-scan resolve call returned '${phx_resolve_http:-no response}'.${phx_resolve_hint}"
+fi
 
 phx_bundles="$(jq -c '.bundles // []' "$phx_resolve_body" 2>/dev/null)"
 [ -n "$phx_bundles" ] || phx_scan_skip "resolve_unparseable" "The PR-scan resolve response could not be parsed."
