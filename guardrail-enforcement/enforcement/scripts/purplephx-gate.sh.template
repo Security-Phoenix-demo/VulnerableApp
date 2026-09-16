@@ -2010,7 +2010,39 @@ phx_execute_req="$PHX_TMP_ROOT/execute.req"
 if [ "$phx_gate" = "commit" ]; then
   phx_base_branch="HEAD"
 else
+  # The base ref is TWO different names, and conflating them is what broke every
+  # push scan.
+  #
+  # LOCALLY it must stay remote-qualified: `phx_base_ref` is fed to
+  # `git merge-base HEAD "$phx_base_ref"` above, and in the developer's clone the
+  # base only exists as `origin/main` -- a bare `main` may not exist at all, or may
+  # be a different, stale local branch. So phx_base_ref itself is NEVER rewritten.
+  #
+  # ON THE SERVER the same name must be bare. The analyzer keeps a MIRROR clone
+  # (`fetch = +refs/heads/*:refs/heads/*`), which has no refs/remotes namespace at
+  # all -- verified on a live instance: `refs/remotes/` count 0, `master` resolves,
+  # `origin/master` does not. Sending the remote-qualified name produced:
+  #
+  #   "Cannot compute PR diff: unresolvable git ref(s) base=origin/<branch>.
+  #    The branch is not present in the server-side repository cache"
+  #
+  # -- on EVERY push-gate invocation, which the gate then reported as a skip. The
+  # message blames the server's cache for what is a client-side naming mismatch,
+  # so nobody reading it would look here.
+  #
+  # Only a leading "<remote>/" is stripped, and only when <remote> is a remote this
+  # repository actually declares. A branch legitimately named `origin/something`,
+  # or any path segment that merely looks like a remote, is left alone: the check
+  # is membership in `git remote`, never a pattern match on a slash.
   phx_base_branch="$phx_base_ref"
+  for phx_bb_remote in $(git -C "$phx_cwd" remote 2>/dev/null); do
+    case "$phx_base_branch" in
+      "$phx_bb_remote"/?*)
+        phx_base_branch="${phx_base_branch#"$phx_bb_remote"/}"
+        break
+        ;;
+    esac
+  done
 fi
 jq -n \
   --arg repoName "$PHX_REPO_NAME" \
