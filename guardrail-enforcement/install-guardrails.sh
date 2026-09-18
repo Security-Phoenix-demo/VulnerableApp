@@ -76,6 +76,9 @@ HELPTEXT
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 info() { printf '  %s\n' "$*"; }
+# Goes to stderr, like die, because a warning that scrolls past in a successful install
+# is a warning nobody reads. The install still succeeds — this is not a die.
+warn() { printf '  WARNING: %s\n' "$*" >&2; }
 step() { printf '\n== %s\n' "$*"; }
 
 # --- arg parsing ------------------------------------------------------------
@@ -324,7 +327,21 @@ phx_install_enforcement() {
         print l
       }
     ' "$gate_tpl" > "$gate_out"
-    [ -n "$API_BASE" ] && info "baked API base -> $API_BASE"
+    if [ -n "$API_BASE" ]; then
+      info "baked API base -> $API_BASE"
+    else
+      # Without --api-base the awk arm above leaves PHX_BAKED_API_BASE holding the
+      # literal __PHX_BASE_URL__, and the gate's own phx_unsubstituted check then falls
+      # back to http://localhost:4250. That is a deliberate upstream default and this
+      # installer does not override it — overriding would re-fork the file this pack has
+      # just finished un-forking. But it IS a surprise worth naming out loud: an operator
+      # who installs with no --api-base gets a gate that talks to a port on their own
+      # machine, fails to reach it, and SKIPS. A skip is not a pass, so nothing is wrongly
+      # approved — but nothing is checked either, and the reason is invisible unless the
+      # install says so here.
+      warn "no --api-base given: the gate will use its built-in fallback http://localhost:4250"
+      warn "  set PHX_API_BASE in the environment, or re-run with --api-base <url>, or the gate will SKIP every scan"
+    fi
     chmod 755 "$gate_out"
   fi
 
