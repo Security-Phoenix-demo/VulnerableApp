@@ -177,7 +177,7 @@ fi
 # 3. Configuration, and what may NOT come out of the repository
 #
 # Four values are baked into the pack at download time and substituted by the installer:
-# https://app.phoenix.security, __PHX_ORG_ID__, __PHX_WORKSPACE_ID__ and the baked fallback policy. The
+# __PHX_BASE_URL__, __PHX_ORG_ID__, __PHX_WORKSPACE_ID__ and the baked fallback policy. The
 # token is NEVER baked (`.claude/rules/client-installable-artifacts.md` R6) — it comes from the
 # environment, exactly as purplephx-session-end.sh reads it.
 #
@@ -201,7 +201,7 @@ fi
 # OUTSIDE the project — the developer's own shell, or a user-level ~/.claude/settings.json.
 # Plain string search only: these files are repository content and are never parsed or sourced.
 # ---------------------------------------------------------------------------
-PHX_BAKED_API_BASE="https://app.phoenix.security"
+PHX_BAKED_API_BASE="__PHX_BASE_URL__"
 PHX_BAKED_ORG_ID="__PHX_ORG_ID__"
 PHX_BAKED_WORKSPACE_ID="__PHX_WORKSPACE_ID__"
 # Baked fallback policy (design section 5 hard defaults). Substituted at download time; the literal
@@ -758,7 +758,159 @@ case "$PHX_API_TOKEN" in
     ;;
 esac
 
-phx_curl_config() { printf 'header = "Authorization: Bearer %s"\n' "$PHX_API_TOKEN"; }
+# ---------------------------------------------------------------------------
+# 8b. Session-gate token exchange (fix21 — closes the credential-TYPE mismatch a whole-branch
+# review found: ExternalTokenAuthenticationFilter requires every bearer on the six routes below to
+# be a short-lived phx_at_* access token, and PHX_API_TOKEN — the credential the installer stores —
+# is the DURABLE phx_live_*/phx_dev_* API key POST /gate-key mints. Sending it verbatim as the
+# bearer, which this script did before this fix, is REJECTED unconditionally by that filter (it
+# never even calls verify() for a bearer that doesn't start with phx_at_) — so the gate could never
+# successfully authenticate on any of its six routes, in any real deployment.
+#
+# `phx_curl_config` below now emits the EXCHANGED access token, never PHX_API_TOKEN directly.
+# `phx_exchange_curl_config` is the one place PHX_API_TOKEN (the raw key) is still sent — to the
+# exchange endpoint itself, which is the only route that accepts it — using the exact same
+# `--config -` piped-stdin discipline as every other call in this file, so the raw key never
+# touches argv either (same rule the comment above already cites).
+#
+# JUDGMENT CALL, disclosed here rather than silently decided: no on-disk cache of the exchanged
+# token across invocations. The exchange happens fresh, once, near the top of every single gate
+# invocation (a fresh shell process each time — there is no long-running process to cache across).
+# Caching a live bearer token in a plaintext file under $PHX_HOME would need its own atomic-write +
+# 0600-permission + expiry-tracking machinery on top of an already very large, carefully-audited
+# script, and would be a NEW class of on-disk artifact for this pack (the existing on-disk caches
+# here are all POLICY data, never a credential). The token's own TTL is 1 hour
+# (ExternalAccessTokenService.DEFAULT_TTL_SECONDS, via issueForSessionGate) and the cost of a fresh
+# exchange is one bounded network round trip, budgeted here exactly like the policy GET a few
+# sections below — not a meaningfully different cost, and simplicity won given no existing
+# precedent for a credential cache in this file.
+#
+# DEGRADE-LIKE-EXISTING-FAILURE, not a new failure mode: if the exchange fails (network error, 401
+# invalid key, 403 wrong scope), this function returns 1 and PHX_GATE_ACCESS_TOKEN stays empty —
+# there is NO new phx_finish_skip call here. `phx_curl_config` then emits an empty bearer, so the
+# policy GET in section 11 below gets its own non-200/non-404 status (exactly as it would on any
+# other network hiccup) and falls through the SAME pre-existing cache-then-baked ladder; if the run
+# proceeds past that to the scan calls, they fail their own existing `[ "$phx_xxx_http" = "200" ] ||
+# phx_scan_skip ...` checks exactly as they would for any other backend failure. No new skip
+# reason, no new finish_skip call site — the pre-existing machinery the brief asked to be reused.
+# ---------------------------------------------------------------------------
+PHX_GATE_ACCESS_TOKEN=""
+phx_exchange_curl_config() { printf 'header = "Authorization: Bearer %s"\n' "$PHX_API_TOKEN"; }
+
+phx_exchange_session_gate_token() { # sets PHX_GATE_ACCESS_TOKEN; returns 0 on success, 1 otherwise
+  phx_budget_ok 3 || return 1
+  local phx_ex_body phx_ex_http phx_ex_token
+  phx_ex_body="$PHX_TMP_ROOT/session-gate-token.json"
+  : > "$phx_ex_body" 2>/dev/null || true
+  phx_ex_http="$(phx_exchange_curl_config | curl -sS --config - \
+      --max-time "$(phx_call_deadline)" \
+      -X POST \
+      -o "$phx_ex_body" -w '%{http_code}' \
+      "$PHX_API_BASE/api/v1/external/auth/session-gate-token" 2>/dev/null)" || phx_ex_http=""
+  [ "$phx_ex_http" = "200" ] || return 1
+  phx_ex_token="$(jq -r '.accessToken // empty' "$phx_ex_body" 2>/dev/null)"
+  [ -n "$phx_ex_token" ] || return 1
+  PHX_GATE_ACCESS_TOKEN="$phx_ex_token"
+  return 0
+}
+
+# The GENERAL exchange (POST /api/v1/external/auth/token), reinstated as a FALLBACK by the
+# 2026-09-16 PR #730 review. It is what an ordinary `phx_live_*`/`phx_dev_*` key -- one WITHOUT the
+# `hook:gate` scope, which is the setup the installation guide documented before fix21 -- has always
+# used. It sends the RAW key via `phx_exchange_curl_config`, the only function permitted to do so.
+# Why the LAST general exchange failed: "token_exchange_failed" (the call itself did not return 200)
+# or "token_exchange_unparseable" (it did, but carried no usable phx_at_* accessToken). Section 10b
+# reports whichever applies. They send an operator to different places -- a bad credential versus a
+# backend answering the right status with the wrong body -- and the pack's suite pins the difference.
+PHX_GATE_EXCHANGE_FAIL=""
+
+phx_exchange_general_token() { # sets PHX_GATE_ACCESS_TOKEN; returns 0 on success, 1 otherwise
+  PHX_GATE_EXCHANGE_FAIL="token_exchange_failed"
+  phx_budget_ok 3 || return 1
+  local phx_gx_body phx_gx_http phx_gx_token
+  phx_gx_body="$PHX_TMP_ROOT/token-exchange.json"
+  : > "$phx_gx_body" 2>/dev/null || true
+  phx_gx_http="$(phx_exchange_curl_config | curl -sS --config - \
+      --max-time "$(phx_call_deadline)" \
+      -X POST \
+      -H 'Content-Type: application/json' \
+      --data-binary '{}' \
+      -o "$phx_gx_body" -w '%{http_code}' \
+      "$PHX_API_BASE/api/v1/external/auth/token" 2>/dev/null)" || phx_gx_http=""
+  if [ "$phx_gx_http" != "200" ]; then rm -f "$phx_gx_body" 2>/dev/null; return 1; fi
+  phx_gx_token="$(jq -r '.accessToken // empty' "$phx_gx_body" 2>/dev/null)"
+  rm -f "$phx_gx_body" 2>/dev/null
+  case "$phx_gx_token" in
+    phx_at_*) ;;
+    *) PHX_GATE_EXCHANGE_FAIL="token_exchange_unparseable"; return 1 ;;
+  esac
+  PHX_GATE_ACCESS_TOKEN="$phx_gx_token"
+  PHX_GATE_EXCHANGE_FAIL=""
+  return 0
+}
+
+# THE single place PHX_GATE_ACCESS_TOKEN is populated, for every credential shape.
+#
+# REGRESSION THIS FIXES (found by the Copilot review on PR #730, 2026-09-16, and confirmed to be
+# WIDER than reported). fix21 repointed `phx_curl_config` from PHX_API_TOKEN to
+# PHX_GATE_ACCESS_TOKEN, but left section 10b's own general exchange in place below. That block
+# then (a) sent `phx_curl_config` -- i.e. the already-exchanged token, or an empty string -- to
+# /auth/token, which only accepts a RAW key, and (b) assigned its result to PHX_API_TOKEN, which
+# nothing downstream reads any more. Both halves were broken, so EVERY credential shape failed:
+#
+#   phx_live_* with hook:gate  -> 10b posted the phx_at_* token to /auth/token -> 401 -> HARD SKIP
+#   phx_live_* ordinary        -> 10b posted an empty bearer                   -> 401 -> HARD SKIP
+#   phx_at_* already           -> nothing ever set PHX_GATE_ACCESS_TOKEN       -> 401 on all six
+#   unrecognised shape         -> the documented "sent as-is" promise silently stopped holding
+#
+# Net: the gate reported BACKEND UNREACHABLE and verified nothing, on every invocation, in every
+# deployment -- this file's own named failure shape, a control that installs, reports itself active,
+# and checks nothing. The three shapes are now dispatched explicitly, and each keeps exactly the
+# behaviour its own section documents.
+phx_obtain_gate_token() { # sets PHX_GATE_ACCESS_TOKEN; returns 0 on success, 1 otherwise
+  case "$PHX_API_TOKEN" in
+    phx_at_*)
+      # Already an access token -- used directly, no exchange, no budget spent.
+      PHX_GATE_ACCESS_TOKEN="$PHX_API_TOKEN"
+      return 0
+      ;;
+    phx_live_*|phx_dev_*)
+      # A `hook:gate`-scoped key gets the narrow SESSION_GATE token; any other key falls back to
+      # the general exchange. Order matters: the narrow purpose is preferred when available.
+      phx_exchange_session_gate_token && return 0
+      phx_exchange_general_token && return 0
+      return 1
+      ;;
+    *)
+      # Unrecognised shape: SENT as-is and the server decides -- see section 10b's `*)` case for
+      # the full argument. The client is not the authority on which credentials a server accepts.
+      PHX_GATE_ACCESS_TOKEN="$PHX_API_TOKEN"
+      return 0
+      ;;
+  esac
+}
+
+# All six gate/pr-scan routes present THIS as their bearer — the exchanged phx_at_* SESSION_GATE
+# token, never the raw phx_live_*/phx_dev_* API key. An empty value here (exchange never attempted
+# or failed) still produces a syntactically valid curl config line whose bearer is simply empty —
+# the backend answers 401 to that exactly as it would to any other bad credential, which is what
+# drives the degrade-like-existing-failure behaviour described above.
+phx_curl_config() { printf 'header = "Authorization: Bearer %s"\n' "$PHX_GATE_ACCESS_TOKEN"; }
+
+# Retry-on-401 wrapper used by all six routes below. A downstream 401 (the access token expired
+# mid-run — plausible during a long PR-scan poll loop under the push gate's ~180s budget) is retried
+# EXACTLY ONCE: re-exchange, then retry this exact call. Never retried on any other status code, and
+# never retried more than once. Prints the http status code on stdout, exactly like the bare
+# `phx_curl_config | curl ... -w '%{http_code}'` pipeline every call site used before this change —
+# callers are otherwise unchanged (same `"$(phx_gate_curl ...)" || var=""` assignment shape).
+phx_gate_curl() { # <curl args forwarded verbatim after --config ->
+  local phx_gc_status
+  phx_gc_status="$(phx_curl_config | curl -sS --config - "$@" 2>/dev/null)" || phx_gc_status=""
+  if [ "$phx_gc_status" = "401" ] && phx_obtain_gate_token; then
+    phx_gc_status="$(phx_curl_config | curl -sS --config - "$@" 2>/dev/null)" || phx_gc_status=""
+  fi
+  printf '%s' "$phx_gc_status"
+}
 
 # ---------------------------------------------------------------------------
 # 9b. Violation queue flush (design section 17.7.2, T7 brief)
@@ -1293,12 +1445,12 @@ phx_flush_violation_queue_locked() { # <queue-file-path> -- always returns 0, se
     fi
     phx_fq_body="$PHX_TMP_ROOT/violation-resp.json"
     : > "$phx_fq_body" 2>/dev/null || true
-    phx_fq_http="$(phx_curl_config | curl -sS --config - \
+    phx_fq_http="$(phx_gate_curl \
         --max-time "$phx_fq_deadline" \
         -H 'Content-Type: application/json' \
         --data-binary "@$phx_fq_chunk" \
         -o "$phx_fq_body" -w '%{http_code}' \
-        "$phx_fq_url" 2>/dev/null)" || phx_fq_http=""
+        "$phx_fq_url")"
     case "$phx_fq_http" in
       2??) ;;
       400)
@@ -1394,6 +1546,14 @@ if [ -z "$PHX_TMP_ROOT" ]; then
     "[purplephx] BACKEND UNREACHABLE - gate skipped: no writable temporary directory."
 fi
 
+# Exchange PHX_API_TOKEN (the raw hook:gate API key) for a short-lived phx_at_* access token, ONCE,
+# before the first of the six gate/pr-scan calls below. See the fix21 comment beside
+# phx_exchange_session_gate_token (section 8b above) for the full defect this closes and the
+# degrade-like-existing-failure design: a failed exchange here is deliberately NOT a hard skip —
+# PHX_GATE_ACCESS_TOKEN simply stays empty and the pre-existing policy/scan skip machinery below
+# handles the resulting non-200 statuses exactly as it already does for any other backend failure.
+phx_obtain_gate_token || true
+
 # ---------------------------------------------------------------------------
 # 10b. API-key exchange (added 2026-09-15)
 #
@@ -1446,31 +1606,23 @@ case "$PHX_API_TOKEN" in
     :
     ;;
   phx_live_*|phx_dev_*)
-    phx_budget_ok 3 || phx_finish_skip "budget_expired" "budget_expired_before_token_exchange" \
-      "[purplephx] BUDGET EXPIRED - gate skipped before the API key could be exchanged for an access token. No scan ran, so NOTHING about this diff has been verified."
-    phx_xchg_body="$PHX_TMP_ROOT/token-exchange.json"
-    phx_xchg_http="$(phx_curl_config | curl -sS --config - \
-        --max-time "$(phx_call_deadline)" \
-        -X POST \
-        -H 'Content-Type: application/json' \
-        --data-binary '{}' \
-        -o "$phx_xchg_body" -w '%{http_code}' \
-        "$PHX_API_BASE/api/v1/external/auth/token" 2>/dev/null)" || phx_xchg_http=""
-    if [ "$phx_xchg_http" != "200" ]; then
-      phx_finish_skip "backend_unreachable" "token_exchange_failed" \
-        "[purplephx] BACKEND UNREACHABLE - gate skipped: exchanging the PHX_API_TOKEN API key for an access token at ${PHX_API_BASE}/api/v1/external/auth/token returned '${phx_xchg_http:-no response}'. No scan ran, so NOTHING about this diff has been verified. A 401 here means the API key is wrong, revoked, expired, or belongs to a different Phoenix environment than PHX_API_BASE points at."
+    # The exchange itself now lives in phx_obtain_gate_token (section 8b), which ran at the top of
+    # this section and already tried BOTH exchanges -- the `hook:gate`-scoped one first, then the
+    # general one this block used to perform inline. What remains here is only the REPORTING half,
+    # kept deliberately: for a key of this shape, producing no token is a configuration error the
+    # operator can fix in one command, so it stays a HARD SKIP with the message this block has
+    # always printed, rather than degrading into a silent cache-then-baked fallthrough.
+    #
+    # The inline curl that used to sit here was removed by the 2026-09-16 PR #730 review. It sent
+    # `phx_curl_config` -- the ALREADY-EXCHANGED token, or an empty string -- to /auth/token, which
+    # accepts only a raw key, and then assigned its result to PHX_API_TOKEN, which nothing reads any
+    # more. See phx_obtain_gate_token's comment for the full four-shape breakdown.
+    if [ -z "$PHX_GATE_ACCESS_TOKEN" ]; then
+      phx_budget_ok 3 || phx_finish_skip "budget_expired" "budget_expired_before_token_exchange" \
+        "[purplephx] BUDGET EXPIRED - gate skipped before the API key could be exchanged for an access token. No scan ran, so NOTHING about this diff has been verified."
+      phx_finish_skip "backend_unreachable" "${PHX_GATE_EXCHANGE_FAIL:-token_exchange_failed}" \
+        "[purplephx] BACKEND UNREACHABLE - gate skipped: exchanging the PHX_API_TOKEN API key for an access token at ${PHX_API_BASE} failed (tried the hook:gate route /api/v1/external/auth/session-gate-token, then the general route /api/v1/external/auth/token). No scan ran, so NOTHING about this diff has been verified. A 401 here means the API key is wrong, revoked, expired, or belongs to a different Phoenix environment than PHX_API_BASE points at."
     fi
-    phx_xchg_token="$(jq -r '.accessToken // ""' "$phx_xchg_body" 2>/dev/null)"
-    rm -f "$phx_xchg_body" 2>/dev/null
-    case "$phx_xchg_token" in
-      phx_at_*) ;;
-      *)
-        phx_finish_skip "backend_unreachable" "token_exchange_unparseable" \
-          "[purplephx] BACKEND UNREACHABLE - gate skipped: the token-exchange response carried no usable phx_at_* accessToken. No scan ran, so NOTHING about this diff has been verified."
-        ;;
-    esac
-    # Every call after this line authenticates with the exchanged access token.
-    PHX_API_TOKEN="$phx_xchg_token"
     ;;
   *)
     # PASSED THROUGH UNCHANGED, and that is a deliberate reversal of this block's
@@ -1524,11 +1676,34 @@ phx_policy_body="$PHX_TMP_ROOT/policy.json"
 phx_policy_http=""
 if phx_budget_ok 3; then
   phx_policy_url="$PHX_API_BASE/api/v1/external/purplephx/enforcement-policy"
-  [ -n "$PHX_WORKSPACE_ID" ] && phx_policy_url="$phx_policy_url?workspaceId=$PHX_WORKSPACE_ID"
-  phx_policy_http="$(phx_curl_config | curl -sS --config - \
+  phx_policy_sep="?"
+  if [ -n "$PHX_WORKSPACE_ID" ]; then
+    phx_policy_url="$phx_policy_url${phx_policy_sep}workspaceId=$PHX_WORKSPACE_ID"
+    phx_policy_sep="&"
+  fi
+  # Percent-encoded via jq's @uri. jq is already a hard dependency (the missing-binary
+  # precondition at the top of this file refuses to run without it), so this adds nothing new.
+  # PHX_REPO_NAME is a directory basename and may contain a space, & or # — unencoded, an & would
+  # truncate the query string, and a truncated workspaceId silently resolves to the ORG grain,
+  # which is a widening rather than an error.
+  phx_repo_enc="$(jq -rn --arg v "$PHX_REPO_NAME" '$v|@uri' 2>/dev/null)"
+  if [ -n "$phx_repo_enc" ]; then
+    phx_policy_url="$phx_policy_url${phx_policy_sep}repoIdentifier=$phx_repo_enc"
+    phx_policy_sep="&"
+  fi
+  # gateVersion. The column and the query parameter have existed since the sighting table shipped
+  # (ExternalEnforcementPolicyController's `gateVersion` @RequestParam), but this script never sent
+  # one, so enforcement_gate_sighting.gate_version was schema-ready and permanently null. Encoded
+  # with @uri for the same reason repoIdentifier is: PHX_GATE_VERSION contains a '/'.
+  phx_gv_enc="$(jq -rn --arg v "$PHX_GATE_VERSION" '$v|@uri' 2>/dev/null)"
+  if [ -n "$phx_gv_enc" ]; then
+    phx_policy_url="$phx_policy_url${phx_policy_sep}gateVersion=$phx_gv_enc"
+    phx_policy_sep="&"
+  fi
+  phx_policy_http="$(phx_gate_curl \
       --max-time 2 \
       -o "$phx_policy_body" -w '%{http_code}' \
-      "$phx_policy_url" 2>/dev/null)" || phx_policy_http=""
+      "$phx_policy_url")"
 fi
 
 phx_apply_policy_json() { # <file> — sets mode/blocking/domains/updatedAt from an API-shaped body
@@ -1640,6 +1815,26 @@ if [ "$phx_policy_source" = "none" ]; then
 fi
 
 case "$phx_policy_mode" in ADVISORY|GATE|BLOCK) ;; *) phx_policy_mode="ADVISORY" ;; esac
+
+# ---------------------------------------------------------------------------
+# 11a. No-workspace disclosure.
+#
+# A gate with no PHX_WORKSPACE_ID can only ever be answered at the ORG grain: the policy fetch
+# omits the parameter entirely (section 11 above), so the server resolves ORG_ROW or
+# SYSTEM_DEFAULT and a WORKSPACE_ROW policy is structurally unreachable. Measured against a live
+# backend: the same endpoint returns ADVISORY/SYSTEM_DEFAULT with no workspaceId and
+# BLOCK/WORKSPACE_ROW with one. An operator who sets BLOCK in the dashboard and leaves this unset
+# therefore gets a gate that can never block, and before this disclosure nothing anywhere said so.
+#
+# Disclosed through phx_policy_note for the SAME reason 11b's exception disclosure is: it is a
+# fact about policy PROVENANCE, orthogonal to the verdict, and that variable is already rendered
+# into every "Policy: ..." line at every phx_finish_* call site. Deliberately NOT stderr —
+# AC-P3-2 and the advisory-path tests require stderr to be empty on an exit-0 run, and stderr is
+# reserved for the loud-skip and missing-dependency cases.
+# ---------------------------------------------------------------------------
+if [ -z "$PHX_WORKSPACE_ID" ]; then
+  phx_policy_note="$phx_policy_note — NO WORKSPACE CONFIGURED (PHX_WORKSPACE_ID unset): org-grain policy only, a workspace-level policy including BLOCK is not applied"
+fi
 
 # ---------------------------------------------------------------------------
 # 11b. Phase 6 T7 — exception disclosure + EXCEPTION_APPLIED violation emission (design section
@@ -1962,12 +2157,12 @@ phx_resolve_body="$PHX_TMP_ROOT/resolve.json"
 phx_resolve_req="$PHX_TMP_ROOT/resolve.req"
 jq -n --arg repoName "$PHX_REPO_NAME" --arg ws "$PHX_WORKSPACE_ID" \
   '{repoName:$repoName, workspaceId:(if $ws == "" then null else $ws end)}' > "$phx_resolve_req"
-phx_resolve_http="$(phx_curl_config | curl -sS --config - \
+phx_resolve_http="$(phx_gate_curl \
     --max-time "$(phx_call_deadline)" \
     -H 'Content-Type: application/json' \
     --data-binary "@$phx_resolve_req" \
     -o "$phx_resolve_body" -w '%{http_code}' \
-    "$PHX_API_BASE/api/v1/external/pr-scan/resolve" 2>/dev/null)" || phx_resolve_http=""
+    "$PHX_API_BASE/api/v1/external/pr-scan/resolve")"
 
 # A 401 here is the first place a wrong-shaped credential becomes visible, so it is
 # the right place to say so — see phx_token_shape_hint's own comment for why the
@@ -2059,12 +2254,12 @@ jq -n \
     changedFiles:$changedFiles, timeoutSeconds:$timeoutSeconds,
     resolvedBundles:$resolvedBundles, domains:$domains}' > "$phx_execute_req"
 
-phx_execute_http="$(phx_curl_config | curl -sS --config - \
+phx_execute_http="$(phx_gate_curl \
     --max-time "$(phx_call_deadline)" \
     -H 'Content-Type: application/json' \
     --data-binary "@$phx_execute_req" \
     -o "$phx_execute_body" -w '%{http_code}' \
-    "$PHX_API_BASE/api/v1/external/pr-scan/execute" 2>/dev/null)" || phx_execute_http=""
+    "$PHX_API_BASE/api/v1/external/pr-scan/execute")"
 
 case "$phx_execute_http" in
   200|202) ;;
@@ -2084,10 +2279,10 @@ while :; do
     phx_finish_skip "budget_expired" "scan_not_terminal_at_budget_expiry" \
       "[purplephx] BUDGET EXPIRED - gate skipped: scan job ${phx_scan_job_id} was still ${phx_job_status} when the gate's internal budget ran out. The scan may still complete; find it in the Phoenix dashboard. NOTHING about this diff has been verified here." "$phx_job_status"
   fi
-  phx_job_http="$(phx_curl_config | curl -sS --config - \
+  phx_job_http="$(phx_gate_curl \
       --max-time "$(phx_call_deadline)" \
       -o "$phx_job_body" -w '%{http_code}' \
-      "$PHX_API_BASE/api/v1/external/pr-scan/$phx_scan_job_id" 2>/dev/null)" || phx_job_http=""
+      "$PHX_API_BASE/api/v1/external/pr-scan/$phx_scan_job_id")"
   if [ "$phx_job_http" = "200" ]; then
     phx_job_status="$(jq -r '.status // "RUNNING"' "$phx_job_body" 2>/dev/null)"
     case "$phx_job_status" in
@@ -2143,10 +2338,10 @@ phx_budget_ok 3 || phx_finish_skip "budget_expired" "budget_expired_before_sarif
   "[purplephx] BUDGET EXPIRED - gate skipped before the scan results could be read. Scan job ${phx_scan_job_id} completed; read it in the Phoenix dashboard. NOTHING about this diff has been verified here." "$phx_job_status"
 
 phx_sarif_body="$PHX_TMP_ROOT/results.sarif"
-phx_sarif_http="$(phx_curl_config | curl -sS --config - \
+phx_sarif_http="$(phx_gate_curl \
     --max-time "$(phx_call_deadline)" \
     -o "$phx_sarif_body" -w '%{http_code}' \
-    "$PHX_API_BASE/api/v1/external/pr-scan/$phx_scan_job_id/sarif" 2>/dev/null)" || phx_sarif_http=""
+    "$PHX_API_BASE/api/v1/external/pr-scan/$phx_scan_job_id/sarif")"
 [ "$phx_sarif_http" = "200" ] || phx_scan_skip "sarif_unavailable" \
   "Scan job ${phx_scan_job_id} completed but its SARIF result returned '${phx_sarif_http:-no response}'."
 
