@@ -478,9 +478,19 @@ if [ "$has_claude" = "1" ]; then
   The gate needs PHX_API_TOKEN in your shell environment. It is never baked into
   the repo, and the gate REFUSES it if it finds it in a project-tracked file.
 
-    export PHX_API_TOKEN=<your token>
+  It must be a key SCOPED TO THE GATE, not an ordinary API key. Mint one with
+  your ordinary key, then export the result:
 
-  Without it the gate SKIPS. A skip is not a pass.
+    curl -sS -X POST -H "Authorization: Bearer \$YOUR_API_KEY" \\
+      ${API_BASE:-https://your-phoenix-host}/api/v1/external/auth/gate-key
+    export PHX_API_TOKEN=<the apiKey from that response>
+
+  An ordinary phx_live_/phx_dev_ key is REFUSED with 403 on the gate's endpoints
+  ("This API key is scoped to the session gate only"), and the gate then SKIPS
+  every scan. That is the one failure mode worth naming twice, because the install
+  looks finished and the gate looks installed.
+
+  Without a usable token the gate SKIPS. A skip is not a pass.
 SUMMARY2
 fi
 printf '\n'
