@@ -33,7 +33,12 @@
 # exit here goes through phx_finish, which writes the observability line first.
 set -uo pipefail
 
-PHX_GATE_VERSION="purplephx-gate/1.0.0"
+# 1.1.0 (2026-09-24): the gate now recognises the FILES_UNRESOLVED terminal status and skips
+# on it instead of reading a scan that saw nothing as a clean pass. That is a BEHAVIOUR change,
+# so the version moves with it: `EnforcementRepoScanner` compares this string against
+# `phx.enforcement.shipped-gate-version` and an unchanged version would leave every already
+# installed copy classified INSTALLED_CURRENT, so no repository would ever be told to refresh.
+PHX_GATE_VERSION="purplephx-gate/1.1.0"
 
 # ---------------------------------------------------------------------------
 # 1. Stdin contract and early exits (design section 6.1, AC-P3-11)
@@ -281,8 +286,16 @@ PHX_SKIP_DIR="$PHX_RECEIPT_DIR/skips"
 # ---------------------------------------------------------------------------
 # 4. Internal budget (design section 6.4, F11, AC-P3-9)
 #
-# The configured hook `timeout` is 30 for commit and 180 for push (section 6.4 item 2); the gate's
-# own budget is that value MINUS 10 seconds of margin. The gate must always decide within its own
+# The gate's own budget is 30 for commit and 180 for push (section 6.4 item 2), MINUS 10 seconds of
+# margin -- so the commit path must decide within 18 seconds.
+#
+# Those two numbers are the SCRIPT's own defaults, not the hook's limit, and this comment said
+# otherwise until 2026-09-24. `.claude-hooks-gate.json.template` carries `"timeout": 180` on BOTH
+# PreToolUse entries, and only the `Bash(gh *)` one passes PHX_GATE_TIMEOUT_SECONDS at all. The
+# commit path therefore self-limits to 18 usable seconds inside a 180-second allowance it already
+# has. A measured commit-gate SAST scan took 54 seconds, so the commit path cannot complete at the
+# current default: it always ends in the `budget_expired` skip. That is a loud skip and is safe; it
+# is not, however, a gate that verifies anything. The gate must always decide within its own
 # budget: a hook killed at its outer timeout has its output DISCARDED, renders no decision, and
 # does not block — and it writes no log line, which is why AC-P3-9 asserts the PRESENCE of a line
 # rather than only its timing. An absent line is itself the failure signal.
@@ -529,7 +542,19 @@ phx_violation_kind_for() { # <verdict> <reason> <skipReason> -> kind on stdout, 
   # after an org disables enforcement was logged backwards, as a SKIP_NO_POLICY violation.
   if [ "$1" = "skip" ]; then
     case "$2" in
-      backend_unreachable) printf 'SKIP_BACKEND_UNREACHABLE'; return 0 ;;
+      # REVIEW FIX (Copilot, medium): `changed_files_unresolved` is a FAIL-OPEN skip and must queue
+      # a violation like every other one. Before this line it fell through to the "prints nothing"
+      # default, so naming the new status explicitly (which improved the human message) silently
+      # REMOVED this event from enforcement telemetry -- the generic non-COMPLETED branch it
+      # replaced had queued SKIP_BACKEND_UNREACHABLE.
+      #
+      # It is mapped onto the EXISTING kind rather than a new one on purpose. The kinds are a wire
+      # contract with `EnforcementViolationKind` and its `ck_ev_kind` CHECK constraint
+      # (VARCHAR(32)), so a dedicated kind needs an enum value AND its own migration, and an
+      # unrecognised kind from an updated gate talking to an older server would be rejected
+      # outright -- losing the very event this restores. The label is therefore inherited and
+      # slightly generic; the accurate wording lives in the skip message the developer reads.
+      backend_unreachable|changed_files_unresolved) printf 'SKIP_BACKEND_UNREACHABLE'; return 0 ;;
       budget_expired) printf 'SKIP_TIMEOUT'; return 0 ;;
       policy_disabled|policy_unavailable) printf 'SKIP_NO_POLICY'; return 0 ;;
     esac
@@ -2293,6 +2318,32 @@ while :; do
   sleep 2
 done
 
+# FILES_UNRESOLVED is named EXPLICITLY, ahead of the generic non-COMPLETED skip below, for the
+# MESSAGE -- not for the safety. The generic branch is already fail-closed BY DESIGN: its own
+# comment covers "anything a future server adds", and the poll loop above allow-lists only the
+# NON-terminal statuses (PENDING|RUNNING), so an unknown status breaks the loop and skips. This
+# status would therefore skip with or without this block.
+#
+# What the generic branch cannot do is say WHY. It reports "BACKEND UNREACHABLE", which blames the
+# network for a mismatch between the tree this gate described and the tree the server scanned --
+# the same misdirection the `origin/<branch>` comment in section 17 warns about, where a
+# client-side naming bug produced a message accusing the server's repository cache. A reader who
+# believes that message goes looking for an outage that is not happening.
+#
+# The condition is this gate's own commit-path limitation arriving back as a status. A staged,
+# uncommitted diff has no branch/PR-shaped representation, so the commit gate encodes it as
+# baseBranch = HEAD plus a changedFiles list (see the "Commit-gate encoding" block above). Both
+# ends of that diff resolve to the same tree, so the server scans a commit that does not contain
+# the change. Before the server learned to report this, that produced verdict ALLOW with zero
+# findings and a null skipReason -- a POSITIVE clean result on code nothing had read, which is
+# strictly worse than no gate (`.claude/rules/evidence-grounding.md` R3).
+if [ "$phx_job_status" = "FILES_UNRESOLVED" ]; then
+  phx_unresolved_detail="$(jq -r '.degradedReason // ""' "$phx_job_body" 2>/dev/null)"
+  [ -n "$phx_unresolved_detail" ] || phx_unresolved_detail="The server did not report which files were unresolved."
+  phx_finish_skip "changed_files_unresolved" "scan_saw_none_of_the_changed_files" \
+    "[purplephx] NOT SCANNED - gate skipped: ${phx_unresolved_detail} A staged, uncommitted change cannot be sent to the scanner, so scan job ${phx_scan_job_id} read the last commit instead and never saw it. Commit and push to have this change scanned. NOTHING about it has been verified here." "$phx_job_status"
+fi
+
 # A non-COMPLETED terminal status (TIMEOUT / ERROR, and anything a future server adds) is a SKIP,
 # never presented as a clean result (`.claude/rules/evidence-grounding.md` R3). This is the same
 # shape as the iac-scanning precedent: a partial or failed scan rendered as "completed" is a false
@@ -2300,6 +2351,23 @@ done
 if [ "$phx_job_status" != "COMPLETED" ]; then
   phx_finish_skip "backend_unreachable" "scan_terminal_not_completed" \
     "[purplephx] BACKEND UNREACHABLE - gate skipped: scan job ${phx_scan_job_id} ended with status ${phx_job_status}, not COMPLETED. A non-completed scan is never read as a clean result, so NOTHING about this diff has been verified." "$phx_job_status"
+fi
+
+# Which key resolved the HEAD end of the diff on the server (migration 255): "branch" (the
+# ordinary, expected case) or "commitSha" (the branch name this gate sent was not resolvable
+# server-side -- typically a branch's FIRST push, before the server has ever seen its name -- and
+# the request's commit sha was used instead). Disclosed only when the fallback actually fired: a
+# "branch" result is the unremarkable default and adds nothing the developer needs to see, exactly
+# the same asymmetry phx_base_disclosure already has for its own rung.
+#
+# Absent/null on a server predating this column, or on any non-COMPLETED path above -- both read
+# as "not disclosed", never as "resolved by branch": stating a rung nobody measured would be worse
+# than saying nothing.
+phx_head_ref_resolved_by="$(jq -r '.headRefResolvedBy // ""' "$phx_job_body" 2>/dev/null)"
+phx_head_disclosure=""
+if [ "$phx_head_ref_resolved_by" = "commitSha" ]; then
+  phx_head_disclosure="
+Head: resolved by commit sha, not branch name (the pushed branch name was not yet visible server-side)"
 fi
 
 # The SCA gap, DISCLOSED and never silently absorbed (D1 obligation 1). PrScanDomainFanOut.runSca
@@ -2542,7 +2610,7 @@ $(phx_wrap_untrusted "$(phx_render_findings "$phx_findings_json" 10)")
   fi
   phx_body="$phx_body
 Policy: advisory $phx_policy_note
-${phx_base_disclosure}${phx_sca_note}
+${phx_base_disclosure}${phx_sca_note}${phx_head_disclosure}
 Findings are reported against changed hunks only; pre-existing debt is not listed. To see everything: /purple-scan"
   phx_finish_allow "$([ "$phx_new_findings" -gt 0 ] && echo new_findings || echo no_findings)" "$phx_body"
 fi
@@ -2561,7 +2629,7 @@ if [ "$phx_blocking_count" -gt 0 ]; then
 $(phx_wrap_untrusted "$(phx_render_findings "$phx_blocking_json" 10)")
 
 Policy: block on ${phx_sev_label} $phx_policy_note
-${phx_base_disclosure}${phx_sca_note}
+${phx_base_disclosure}${phx_sca_note}${phx_head_disclosure}
 Guidance above is the scanning rule's own message; this scan surface supplies no separate
 remediation field. Fix these, then run the command again. To see everything: /purple-scan"
   phx_finish_deny "new_findings" "$phx_block_msg"
@@ -2575,4 +2643,4 @@ phx_envelope "pass" "" "COMPLETED" "$phx_by_severity" "$phx_new_detail" "$phx_ba
 phx_finish_allow "no_findings" "[purplephx] PASS - no new ${phx_sev_label} findings in this ${phx_diff_word} diff.
 
 Policy: block on ${phx_sev_label} $phx_policy_note
-${phx_base_disclosure}${phx_sca_note}"
+${phx_base_disclosure}${phx_sca_note}${phx_head_disclosure}"
