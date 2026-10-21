@@ -6,3 +6,4 @@ public class HardcodedSecrets {
     static final String AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 }
 // rescan
+// rescan 2
