@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  INTENTIONALLY VULNERABLE — Phoenix correlation test fixture. NOT a build file.
+
+  DELIBERATELY NAMED `pom-vulnerable.xml`, NOT `pom.xml`. VulnerableApp builds with Gradle
+  (build.gradle at the repo root); a file named pom.xml here would be picked up by Maven-aware
+  tooling and by the SBOM generator's Tier-1.5 `mvn` probe as if it were a real module, which
+  would change the app's dependency inventory rather than just adding a scan target.
+
+  TARGET: SCA findings with real CVEs, as chain material.
+
+  HONEST LIMIT — THIS CANNOT CHAIN TODAY. Correlation edge B (SCA <-> endpoint-bearing finding) is
+  STRUCTURALLY UNREACHABLE in the shipped pipeline: RisksFindingsQueryServiceImpl.mapScaCveRow
+  hardcodes `reachabilityDistance = null` and `sourceEndpoints = emptyList()`, and
+  ScaReachabilityEdgeVerifier requires both. No SCA row from any manifest can satisfy it. This
+  fixture is therefore useful for (a) proving SCA DETECTION works and (b) being the corpus half of
+  a regression test for that defect — not for producing a toxic combination. If edge B is ever
+  fixed, these components are what it will have to chain.
+
+  Versions below are genuinely vulnerable and genuinely old; the CVEs are real and public.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.sasanlabs.phxtestbed</groupId>
+  <artifactId>phx-testbed-sca-fixture</artifactId>
+  <version>0.0.1-FIXTURE</version>
+  <packaging>jar</packaging>
+
+  <dependencies>
+    <!-- CVE-2020-36518 / CVE-2022-42003 — deep-nesting DoS in jackson-databind. -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>2.9.8</version>
+    </dependency>
+
+    <!-- CVE-2022-42889 "Text4Shell" — RCE via StringSubstitutor interpolation. -->
+    <dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-text</artifactId>
+      <version>1.9</version>
+    </dependency>
+
+    <!-- CVE-2021-44228 "Log4Shell" — JNDI lookup RCE. The canonical reachability example. -->
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <version>2.14.1</version>
+    </dependency>
+
+    <!-- CVE-2015-6420 / CVE-2017-15708 — unsafe deserialisation in commons-collections. -->
+    <dependency>
+      <groupId>commons-collections</groupId>
+      <artifactId>commons-collections</artifactId>
+      <version>3.2.1</version>
+    </dependency>
+
+    <!-- CVE-2016-1000027 — Spring HttpInvoker deserialisation. -->
+    <dependency>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-web</artifactId>
+      <version>4.3.9.RELEASE</version>
+    </dependency>
+  </dependencies>
+</project>
