@@ -137,6 +137,8 @@ dependencies {
     }
 
     implementation group: 'org.springframework.boot', name: 'spring-boot-starter-web'
+    // lab 1 fixture: log4j-core 2.14.1 (CVE-2021-44228 Log4Shell, critical)
+    implementation group: 'org.apache.logging.log4j', name: 'log4j-core', version: '2.14.1'
 
     // https://mvnrepository.com/artifact/org.mockito/mockito-core
     testImplementation group: 'org.mockito', name: 'mockito-core', version: '3.5.13'
