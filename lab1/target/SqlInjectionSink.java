@@ -30,9 +30,11 @@ public class SqlInjectionSink {
         return ps.executeQuery();
     }
 
-    // ORDER BY cannot be parameterised, so the column comes from a fixed allow-list.
+    // ORDER BY cannot be parameterised, so input only selects between constant queries.
     public ResultSet listUsersSorted(Connection conn, String sortColumn) throws Exception {
-        String column = java.util.Set.of("id", "username").contains(sortColumn) ? sortColumn : "id";
-        return conn.createStatement().executeQuery("SELECT id, username FROM users ORDER BY " + column);
+        String sql = "username".equals(sortColumn)
+                ? "SELECT id, username FROM users ORDER BY username"
+                : "SELECT id, username FROM users ORDER BY id";
+        return conn.prepareStatement(sql).executeQuery();
     }
 }
