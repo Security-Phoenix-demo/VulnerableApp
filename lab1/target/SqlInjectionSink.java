@@ -19,21 +19,20 @@
 
 import java.sql.Connection;
 import java.sql.ResultSet;
-import java.sql.Statement;
+import java.sql.PreparedStatement;
 
 public class SqlInjectionSink {
 
-    // Raw string concatenation of an untrusted parameter into a SQL statement.
+    // Value bound as a parameter, so input cannot change the statement.
     public ResultSet findUserById(Connection conn, String userId) throws Exception {
-        Statement stmt = conn.createStatement();
-        String sql = "SELECT id, username, email FROM users WHERE id = '" + userId + "'";
-        return stmt.executeQuery(sql);
+        PreparedStatement ps = conn.prepareStatement("SELECT id, username, email FROM users WHERE id = ?");
+        ps.setString(1, userId);
+        return ps.executeQuery();
     }
 
-    // Second sink, ORDER BY position — not parameterisable even in principle, so a fix here has to
-    // be an allow-list. Included so the fixture has more than one distinct finding to cluster.
+    // ORDER BY cannot be parameterised, so the column comes from a fixed allow-list.
     public ResultSet listUsersSorted(Connection conn, String sortColumn) throws Exception {
-        Statement stmt = conn.createStatement();
-        return stmt.executeQuery("SELECT id, username FROM users ORDER BY " + sortColumn);
+        String column = java.util.Set.of("id", "username").contains(sortColumn) ? sortColumn : "id";
+        return conn.createStatement().executeQuery("SELECT id, username FROM users ORDER BY " + column);
     }
 }

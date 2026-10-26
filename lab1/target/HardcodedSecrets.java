@@ -1,8 +1,8 @@
 package lab1.target;
 
-// LAB FIXTURE: AWS documentation example credentials, not real. Planted so the secret scan has a finding.
+// Credentials come from the environment, never from source.
 public class HardcodedSecrets {
-    static final String AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
-    static final String AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    static final String AWS_ACCESS_KEY_ID = System.getenv("AWS_ACCESS_KEY_ID");
+    static final String AWS_SECRET_ACCESS_KEY = System.getenv("AWS_SECRET_ACCESS_KEY");
 }
 // rescan marker 1792961502

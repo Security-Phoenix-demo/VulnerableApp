@@ -6,13 +6,20 @@ import java.io.ObjectInputStream;
 // LAB FIXTURE, intentionally vulnerable and not compiled (outside src/). Planted so SAST has critical findings.
 public class CommandInjectionSink {
 
-    // OS command injection: untrusted host is concatenated into a shell command.
+    private static final java.util.regex.Pattern HOST = java.util.regex.Pattern.compile("[A-Za-z0-9.-]{1,253}");
+
+    // No shell: fixed argument array, host checked against an allow-list pattern.
     public Process ping(String host) throws Exception {
-        return Runtime.getRuntime().exec("sh -c 'ping -c 1 " + host + "'");
+        if (!HOST.matcher(host).matches() || host.startsWith("-")) {
+            throw new IllegalArgumentException("invalid host");
+        }
+        return new ProcessBuilder("ping", "-c", "1", host).start();
     }
 
-    // Unsafe deserialization of untrusted bytes.
+    // Deserialization limited to an allow-list of classes; everything else is rejected.
     public Object load(InputStream untrusted) throws Exception {
-        return new ObjectInputStream(untrusted).readObject();
+        ObjectInputStream in = new ObjectInputStream(untrusted);
+        in.setObjectInputFilter(java.io.ObjectInputFilter.Config.createFilter("java.lang.String;java.util.*;!*"));
+        return in.readObject();
     }
 }
