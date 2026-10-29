@@ -1,0 +1,4 @@
+# Synthetic dependency fixture. Never install these packages.
+PyYAML==5.3
+requests==2.19.1
+urllib3==1.25.2
