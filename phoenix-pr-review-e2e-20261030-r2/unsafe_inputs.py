@@ -7,7 +7,7 @@ import yaml
 
 def run_report(user_input: str) -> str:
     result = subprocess.run(
-        "echo " + user_input, shell=True, capture_output=True, text=True
+        "echo " + user_input, shell=False, capture_output=True, text=True
     )
     return result.stdout
 
