@@ -19,21 +19,31 @@
 
 import java.sql.Connection;
 import java.sql.ResultSet;
-import java.sql.Statement;
+import java.sql.PreparedStatement;
+import java.util.Map;
 
 public class SqlInjectionSink {
 
-    // Raw string concatenation of an untrusted parameter into a SQL statement.
+    // Fixed: the value is bound as a parameter, so it cannot change the query.
     public ResultSet findUserById(Connection conn, String userId) throws Exception {
-        Statement stmt = conn.createStatement();
-        String sql = "SELECT id, username, email FROM users WHERE id = '" + userId + "'";
-        return stmt.executeQuery(sql);
+        PreparedStatement stmt =
+                conn.prepareStatement("SELECT id, username, email FROM users WHERE id = ?");
+        stmt.setString(1, userId);
+        return stmt.executeQuery();
     }
 
-    // Second sink, ORDER BY position — not parameterisable even in principle, so a fix here has to
-    // be an allow-list. Included so the fixture has more than one distinct finding to cluster.
+    // Fixed: ORDER BY cannot be parameterised, so the column comes from a fixed allow-list.
+    private static final Map<String, PreparedStatementSql> SORTABLE = Map.of(
+            "id", new PreparedStatementSql("SELECT id, username FROM users ORDER BY id"),
+            "username", new PreparedStatementSql("SELECT id, username FROM users ORDER BY username"));
+
+    private record PreparedStatementSql(String sql) {}
+
     public ResultSet listUsersSorted(Connection conn, String sortColumn) throws Exception {
-        Statement stmt = conn.createStatement();
-        return stmt.executeQuery("SELECT id, username FROM users ORDER BY " + sortColumn);
+        PreparedStatementSql entry = SORTABLE.get(sortColumn);
+        if (entry == null) {
+            throw new IllegalArgumentException("Unsupported sort column");
+        }
+        return conn.prepareStatement(entry.sql()).executeQuery();
     }
 }
